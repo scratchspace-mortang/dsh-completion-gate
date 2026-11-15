@@ -581,3 +581,41 @@ test('regression: deleted tracked file claims with absent digest', async t => {
   const entry = report.repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, 'deleted.js'))
   assert.equal(entry.key, 'absent', 'the deleted file keeps the absent digest')
 })
+
+test('regression: symlinked cwd selected as the repository is one root for review and claim', async t => {
+  // A non-git directory reaches the fallback root, which the claim route and seenRoot file and select lexically
+  // (the symlink spelling). A review-only attest must therefore give the same-root advice (add it to claims),
+  // not send the caller to attest against the same cwd, and a following claim against that cwd must file it.
+  fs.mkdirSync(workRoot, { recursive: true })
+  const real = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'cg-symlinked-cwd-')))
+  const linked = path.join(workRoot, `${path.basename(real)}-link`)
+  fs.symlinkSync(real, linked)
+  t.after(() => fs.rmSync(linked, { force: true }))
+  fs.writeFileSync(path.join(real, 'a.js'), 'export const a = 1\n')
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(linked)
+  parentIdleTurn(svc, parent, 1)
+  const agent = agentFor(linked, parent.id)
+  await assert.rejects(svc.attest(agent, {
+    action: 'attest', repository_root: linked,
+    reviewed_code_files: ['a.js'],
+    items: [],
+  }), error => {
+    const message = error?.errors?.join('\n') ?? String(error)
+    assert.match(message, /Add it to claims instead/, 'a review of an unfiled file in the selected root advises the claim route')
+    assert.doesNotMatch(message, /attest against/, 'the selected root is not named as a different root')
+    return true
+  })
+  const done = await svc.attest(agent, {
+    action: 'attest', repository_root: linked,
+    claims: [{ path: 'a.js', decision: 'mine' }],
+    reviewed_code_files: ['a.js'],
+    demonstrated_files: [{ path: 'a.js', note: 'ran the fixture' }],
+    items: [],
+  })
+  assert.equal(done.pass, true, done.markdown)
+  assert.deepEqual(done.blockers, [])
+  const report = await svc.repositoryReport(agent)
+  assert.ok(report.repositories.some(r => r.root === linked && r.files.some(f => f.absolute === path.join(real, 'a.js') && f.claim === 'mine')), 'the claim files under the symlinked cwd root')
+})
