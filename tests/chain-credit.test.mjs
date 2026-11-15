@@ -59,8 +59,23 @@ function service({ workspaceChanges = recorder(), settingsDir = null } = {}) {
       { type, seq: ++published, time: Date.now(), data },
     )
   }
-  instance.disposeSession = id => listeners.get('session/disposed')({ id })
+  instance.disposeSession = async (id, cwd = '') => { await listeners.get('session/disposed')({ id, header: cwd ? { cwd } : {} }) }
   return instance
+}
+
+// Run the body against a fresh service and remove its state directory after,
+// so the cleanup in every test stays one line (a third copy of the setup
+// block factors a helper instead of repeating the try/finally).
+async function withCleanup(svc, body) {
+  try { return await body(svc) } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+}
+
+// Run the body with a first service and its shared state directory, for the
+// restart tests that stand in a second service over the same directory.
+async function withSharedSettings(body) {
+  const first = service()
+  const settingsDir = first.__testSettingsDir
+  try { return await body(first, settingsDir) } finally { fs.rmSync(settingsDir, { recursive: true, force: true }) }
 }
 
 function sessionOf(id, header = {}) { return { id, header } }
@@ -250,7 +265,7 @@ test('a disposed child keeps its credited write for the parent', async t => {
     const child = childOf(repo, parent.id, 'child-1', 1)
     parentIdleTurn(svc, parent, 1)
     writerTurn(svc, child, 1, 'kept.js')
-    svc.disposeSession(child.id)
+    await svc.disposeSession(child.id)
     const report = await svc.repositoryReport(agentFor(repo, parent.id))
     assert.deepEqual(filesOf(report), [path.join(repo, 'kept.js')], 'disposal of the child must not drop its credited write')
   } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
@@ -360,7 +375,7 @@ test('parent disposal before attestation retains the marker for a restart', asyn
   writerTurn(first, child, 1, 'kept.js')
   const settingsDir = first.__testSettingsDir
   try {
-    first.disposeSession(parent.id)
+    await first.disposeSession(parent.id, repo)
     const secondSvc = service({ settingsDir })
     secondSvc.__testSettingsDir = settingsDir
     parentIdleTurn(secondSvc, parent, 1)
@@ -456,4 +471,177 @@ test('a corrupt retained marker is named as a warning with unknown coverage', as
     assert.deepEqual(filesOf(report), [path.join(repo, 'corrupt.js')], 'the in-memory record still files while the marker is corrupt')
     assert.ok(report.notices.some(notice => /retained/i.test(notice) && /unknown/i.test(notice)), `status names the retained-record loss with unknown coverage: ${JSON.stringify(report.notices)}`)
   } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+// Per-operation provenance: a second child writer on the same unchanged path
+// does not ride the first writer's adoption. The attestation digest binds the
+// credited provenance, so the second write reopens the repository, and a new
+// attest without adopted_files is refused until the new provenance is adopted.
+test('a second child writer on the same unchanged path does not ride the first adoption', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'shared.js'), 'const same = 1\n')
+  writeUnitCatalog(repo)
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const first = childOf(repo, parent.id, 'child-1', 1)
+    const second = childOf(repo, parent.id, 'child-2', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, first, 1, 'shared.js')
+    const agent = agentFor(repo, parent.id)
+    const base = {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'shared.js', decision: 'mine' }],
+      reviewed_code_files: ['shared.js'],
+      demonstrated_files: [{ path: 'shared.js', note: 'ran the fixture' }],
+      items: [{ id: 'unit', state: 'passed' }], summary: 'Adopted the first write.',
+    }
+    const accepted = await svc.attest(agent, { ...base, adopted_files: ['shared.js'] })
+    assert.equal(accepted.pass, true, 'attest adopting the first writer passes')
+    writerTurn(svc, second, 1, 'shared.js')
+    const report = await svc.repositoryReport(agent)
+    assert.equal(report.repositories[0].complete, false, 'the second writer reopens the repository instead of riding the first adoption')
+    assert.equal(report.repositories[0].files[0].writerId, 'child-2', 'the filed record names the latest writer')
+    await assert.rejects(svc.attest(agent, base), /adopt/i, 'attest without adoption must refuse the new writer provenance')
+    const readopted = await svc.attest(agent, { ...base, adopted_files: ['shared.js'] })
+    assert.equal(readopted.pass, true, `attest adopting the new writer passes: ${JSON.stringify(readopted.blockers)}`)
+  })
+})
+
+// docs_checked is a review of documentation, so it needs adoption for a
+// child-written doc the same way a code review does: the second writer's doc
+// write is not covered by docs_checked without adopted_files.
+test('docs_checked does not cover a second writer doc without adoption', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'doc.md'), '# Doc\n')
+  writeUnitCatalog(repo)
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const first = childOf(repo, parent.id, 'child-1', 1)
+    const second = childOf(repo, parent.id, 'child-2', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, first, 1, 'doc.md')
+    const agent = agentFor(repo, parent.id)
+    const base = {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'doc.md', decision: 'mine' }],
+      docs_checked: true,
+      demonstrated_files: [{ path: 'doc.md', note: 'read the doc' }],
+      items: [{ id: 'unit', state: 'passed' }], summary: 'Adopted the first doc write.',
+    }
+    const accepted = await svc.attest(agent, { ...base, adopted_files: ['doc.md'] })
+    assert.equal(accepted.pass, true, 'attest adopting the first doc writer passes')
+    writerTurn(svc, second, 1, 'doc.md')
+    await assert.rejects(svc.attest(agent, base), /adopt/i, 'docs_checked without adoption must refuse the new writer provenance')
+    const readopted = await svc.attest(agent, { ...base, adopted_files: ['doc.md'] })
+    assert.equal(readopted.pass, true, `attest adopting the new doc writer passes: ${JSON.stringify(readopted.blockers)}`)
+  })
+})
+
+// Corrupt marker preservation: a corrupt marker is renamed aside with its
+// bytes intact before the same writer's new write overwrites that writer's
+// record, not silently replaced by it. The loss is named with unknown
+// coverage in the status.
+test('a corrupt retained marker is preserved when the same writer writes after a restart', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'a.js'), 'const a = 1\n')
+  fs.writeFileSync(path.join(repo, 'b.js'), 'const b = 1\n')
+  await withSharedSettings(async (first, settingsDir) => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(first, parent, 1)
+    writerTurn(first, child, 1, 'a.js')
+    const dir = first.changes.creditedDir
+    for (const marker of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, marker), '{ not json CORRUPT-BYTES')
+    const second = service({ settingsDir })
+    second.__testSettingsDir = settingsDir
+    parentIdleTurn(second, parent, 1)
+    writerTurn(second, child, 2, 'b.js')
+    const preserved = fs.readdirSync(dir).filter(name => fs.readFileSync(path.join(dir, name), 'utf8').includes('CORRUPT-BYTES'))
+    assert.equal(preserved.length, 1, 'the corrupt bytes survive in exactly one preserved file')
+    const report = await second.repositoryReport(agentFor(repo, parent.id))
+    assert.deepEqual(filesOf(report), [path.join(repo, 'b.js')], 'the new write files while the corrupt record stays unknown')
+    assert.ok(report.notices.some(notice => /retained/i.test(notice) && /unknown/i.test(notice)), `status names the preserved corrupt marker with unknown coverage: ${JSON.stringify(report.notices)}`)
+  })
+})
+
+// Stale parent snapshot: a child write that ends after the last attestation
+// but before disposal must not be unlinked with its marker. Disposal refreshes
+// and compares, so the marker survives for the restart that recovers it.
+test('parent disposal after a late child write retains the marker for a restart', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'first.js'), 'const first = 1\n')
+  fs.writeFileSync(path.join(repo, 'second.js'), 'const second = 1\n')
+  writeUnitCatalog(repo)
+  await withSharedSettings(async (first, settingsDir) => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(first, parent, 1)
+    writerTurn(first, child, 1, 'first.js')
+    const agent = agentFor(repo, parent.id)
+    const attested = await first.attest(agent, {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'first.js', decision: 'mine' }],
+      reviewed_code_files: ['first.js'],
+      demonstrated_files: [{ path: 'first.js', note: 'ran the fixture' }],
+      adopted_files: ['first.js'],
+      items: [{ id: 'unit', state: 'passed' }], summary: 'Adopted the first write.',
+    })
+    assert.equal(attested.pass, true, 'precondition: the first write is attested')
+    // The interleaving: the child write ends after the attestation, and no
+    // report runs before disposal.
+    writerTurn(first, child, 2, 'second.js')
+    await first.disposeSession(parent.id, repo)
+    const secondSvc = service({ settingsDir })
+    secondSvc.__testSettingsDir = settingsDir
+    parentIdleTurn(secondSvc, parent, 1)
+    const report = await secondSvc.repositoryReport(agent)
+    assert.deepEqual(filesOf(report), [path.join(repo, 'first.js'), path.join(repo, 'second.js')], 'the retained marker keeps every child write, including the late one, for a restart')
+  })
+})
+
+// Same-process unattested disposal: disposing the parent without attestation
+// keeps the credited operations in memory, so a same-process report still
+// files them instead of silently seeing nothing.
+test('unattested parent disposal keeps credited writes for a same-process report', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'kept.js'), 'const kept = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, child, 1, 'kept.js')
+    const agent = agentFor(repo, parent.id)
+    assert.deepEqual(filesOf(await svc.repositoryReport(agent)), [path.join(repo, 'kept.js')], 'precondition: the child write files')
+    await svc.disposeSession(parent.id, repo)
+    parentIdleTurn(svc, parent, 2)
+    const after = await svc.repositoryReport(agent)
+    assert.deepEqual(filesOf(after), [path.join(repo, 'kept.js')], 'the same process must still file the unattested credited write after disposal')
+  })
+})
+
+// The other side of disposal: once a durable attestation covers the exact
+// writer turns and paths, disposal deletes the markers.
+test('parent disposal deletes markers once the attestation covers the child writes', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'covered.js'), 'const covered = 1\n')
+  writeUnitCatalog(repo)
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, child, 1, 'covered.js')
+    const agent = agentFor(repo, parent.id)
+    const attested = await svc.attest(agent, {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'covered.js', decision: 'mine' }],
+      reviewed_code_files: ['covered.js'],
+      demonstrated_files: [{ path: 'covered.js', note: 'ran the fixture' }],
+      adopted_files: ['covered.js'],
+      items: [{ id: 'unit', state: 'passed' }], summary: 'Adopted the child write.',
+    })
+    assert.equal(attested.pass, true, 'precondition: the child write is attested')
+    assert.ok(fs.readdirSync(svc.changes.creditedDir).length > 0, 'precondition: a retained marker exists')
+    await svc.disposeSession(parent.id, repo)
+    assert.deepEqual(fs.readdirSync(svc.changes.creditedDir), [], 'disposal deletes the markers the attestation covers')
+  })
 })

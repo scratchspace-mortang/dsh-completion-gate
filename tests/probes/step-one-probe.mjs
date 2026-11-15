@@ -7,6 +7,9 @@
 // host-scope `session/event` listener — the gate's hook — receives, including
 // the session header lineage on each delivery.
 // Question: are raw descendant tool/call and turn/end events delivered to the gate?
+// Scope: this probe claims delivery only. The events are appended, not
+// dispatched, so it proves nothing about agent dispatch or file writes; the
+// dispatch proof is step-two-probe.mjs.
 // Re-run: DSH_CHECKOUT=/home/wilder/git-repos/deepseek-harness-020 node tests/probes/step-one-probe.mjs
 // DSH_CHECKOUT names the DeepSeek Harness checkout whose built SessionStore
 // this probe mounts; the default is that checkout on the author's machine.
