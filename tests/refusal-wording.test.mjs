@@ -9,9 +9,11 @@ import { userMessage } from './user-message.mjs'
 
 // Refusal wording and retention naming (ticket kxeh): an unfiled path in an
 // attest refusal names the condition, the next action (the claim route for a
-// review, demonstration, or adoption entry; a plain statement that no action
-// helps for a claim, which already tried that route), and never suggests
-// touching a file to force a record. A record loss the gate cannot detect may
+// review, demonstration, or adoption entry over a path the claim route can
+// file, namely a file on disk or a tracked deletion; a plain statement that no
+// action helps for a claim, which already tried that route, and for such an
+// entry over a typo name the claim route cannot file either), and never
+// suggests touching a file to force a record. A record loss the gate cannot detect may
 // be present in any status render, so every render qualifies coverage rather
 // than reading the filed set as complete; a known child record loss is named
 // in status as a warning. Filed paths keep their existing behavior.
@@ -223,4 +225,29 @@ test('a review-only refusal names the claim route, and the claim-carrying attest
   })
   assert.equal(accepted.pass, true, `a claim-carrying attest passes with blockers=[]: ${JSON.stringify(accepted.blockers)}`)
   assert.deepEqual(accepted.blockers, [], 'the claim-carrying attest has no blockers')
+})
+
+// A review-only refusal over a typo name (no file on disk, never tracked) must
+// not promise the claim route, because the claim route refuses that name too
+// (stagedAttest skips a missing name git never tracked). It takes the same
+// no-action wording a claim takes, so the two refusals no longer contradict.
+test('a review-only refusal over a nonexistent untracked path does not promise the claim route', async t => {
+  const repo = tempRepo()
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  const agent = agentFor(repo, parent.id)
+  const refusal = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    reviewed_code_files: ['missing.js'],
+  }).then(() => null, e => e)
+  assert.ok(refusal, 'a review-only attest over a typo name must refuse')
+  const message = refusal.message
+  assert.match(message, /missing\.js is not a changed file of this repository\./, 'the refusal still names the path as unfiled')
+  assert.match(message, /No filed record names it/, 'the refusal names the condition')
+  assert.match(message, /Check the spelling and the path/, 'the refusal names the next action')
+  assert.match(message, /no action on this path helps/, 'the refusal states plainly that no action helps')
+  assert.doesNotMatch(message, /Add it to claims instead/, 'the refusal never promises the claim route it cannot keep')
+  assert.doesNotMatch(message, /a claim is the route that files it/, 'the refusal never calls the claim route the filing route')
+  assert.doesNotMatch(message, /touch/i, 'the refusal never suggests touching a file')
 })
