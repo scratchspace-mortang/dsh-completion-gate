@@ -8,11 +8,13 @@ import { CompletionGateService } from '../lib/index.js'
 import { userMessage } from './user-message.mjs'
 
 // Refusal wording and retention naming (ticket kxeh): an unfiled path in an
-// attest refusal names the condition, the next action, or a plain statement
-// that no action helps, and never suggests touching a file to force a record.
-// A known child record loss is named in status as a warning; a record loss
-// the gate cannot detect leaves coverage unknown, and that state is named.
-// Filed paths keep their existing behavior.
+// attest refusal names the condition, the next action (the claim route for a
+// review, demonstration, or adoption entry; a plain statement that no action
+// helps for a claim, which already tried that route), and never suggests
+// touching a file to force a record. A record loss the gate cannot detect may
+// be present in any status render, so every render qualifies coverage rather
+// than reading the filed set as complete; a known child record loss is named
+// in status as a warning. Filed paths keep their existing behavior.
 const workRoot = path.join(os.homedir(), 'Trash', '3t34-tests')
 
 function makeWorkDir(prefix) {
@@ -174,4 +176,51 @@ test('a record loss the gate cannot detect leaves coverage unknown in status', a
   const notice = report.notices.find(n => /Coverage unknown/.test(n))
   assert.ok(notice, `status names coverage unknown, not clean: ${JSON.stringify(report.notices)}`)
   assert.match(notice, /Warning:/, 'the unknown coverage is named as a warning')
+})
+
+// A fully undetectable loss: with no observable record at all, status still
+// qualifies coverage as a plain notice, so "nothing attributed yet" never
+// reads as "coverage is complete", and the ordinary no-work case gets no alarm.
+test('a status with no observable record qualifies coverage as a plain notice', async t => {
+  const repo = tempRepo()
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const status = await svc.statusResult(agentFor(repo, 'parent-1'))
+  assert.match(status.markdown, /No changed file is attributed to a repository in this session yet\./, 'the empty state is still named')
+  assert.match(status.markdown, /Notice: A record loss the gate cannot detect may be present, so nothing here proves coverage is complete\./, 'the undetectable-loss caveat is named')
+  assert.doesNotMatch(status.markdown, /Warning:/, 'the caveat is a notice, not an alarm')
+})
+
+// A review-only attest refusal must name the claim route as the next action:
+// the same attest carrying claims files the path and passes, so "no action
+// helps" would contradict the legitimate route.
+test('a review-only refusal names the claim route, and the claim-carrying attest passes', async t => {
+  const repo = tempRepo()
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  const agent = agentFor(repo, parent.id)
+  await svc.register(agent, { repository_root: repo, items: [{ name: 'Unit', proves: 'app.js sets value' }] })
+  const refusal = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    reviewed_code_files: ['app.js'],
+  }).then(() => null, e => e)
+  assert.ok(refusal, 'a review-only attest over an unfiled path must refuse')
+  const message = refusal.message
+  assert.match(message, /app\.js is not a changed file of this repository\./, 'the refusal still names the path as unfiled')
+  assert.match(message, /No filed record names it/, 'the refusal names the condition')
+  assert.match(message, /Add it to claims instead/, 'the refusal names the claim route as the next action')
+  assert.match(message, /mine or not-mine/, 'the refusal names the decision to claim with')
+  assert.doesNotMatch(message, /no action on this path helps/, 'the refusal never denies the claim route')
+  assert.doesNotMatch(message, /touch/i, 'the refusal never suggests touching a file')
+  const accepted = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'],
+    demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+    summary: 'The claim route files the path.',
+  })
+  assert.equal(accepted.pass, true, `a claim-carrying attest passes with blockers=[]: ${JSON.stringify(accepted.blockers)}`)
+  assert.deepEqual(accepted.blockers, [], 'the claim-carrying attest has no blockers')
 })
