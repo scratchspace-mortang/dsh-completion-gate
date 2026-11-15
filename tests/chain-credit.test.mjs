@@ -619,6 +619,71 @@ test('unattested parent disposal keeps credited writes for a same-process report
   })
 })
 
+// Durable corrupt-loss indication: a corrupt marker preserved aside during a
+// later write must keep the loss unknown after another restart, not read as
+// clean on a fresh tracker whose in-memory losses are empty.
+test('a preserved corrupt marker keeps coverage unknown after a second restart', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'a.js'), 'const a = 1\n')
+  fs.writeFileSync(path.join(repo, 'b.js'), 'const b = 1\n')
+  await withSharedSettings(async (first, settingsDir) => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(first, parent, 1)
+    writerTurn(first, child, 1, 'a.js')
+    const dir = first.changes.creditedDir
+    for (const marker of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, marker), '{ not json CORRUPT-BYTES')
+    const second = service({ settingsDir })
+    second.__testSettingsDir = settingsDir
+    parentIdleTurn(second, parent, 1)
+    writerTurn(second, child, 2, 'b.js')
+    const preserved = fs.readdirSync(dir).filter(name => name.includes('.json.corrupt-'))
+    assert.equal(preserved.length, 1, 'precondition: the corrupt marker is preserved aside')
+    const third = service({ settingsDir })
+    third.__testSettingsDir = settingsDir
+    parentIdleTurn(third, parent, 1)
+    const report = await third.repositoryReport(agentFor(repo, parent.id))
+    assert.deepEqual(filesOf(report), [path.join(repo, 'b.js')], 'the new write files after the second restart')
+    assert.ok(report.notices.some(notice => /retained/i.test(notice) && /unknown/i.test(notice)), `status names the preserved corrupt marker with unknown coverage: ${JSON.stringify(report.notices)}`)
+  })
+})
+
+// A still-open descendant turn is not part of the credited operations the
+// attestation comparison sees, so disposal must retain the marker even when
+// the earlier ended writes are fully attested; otherwise it deletes the
+// in-flight write before its turn ends.
+test('parent disposal with a still-open child turn retains the in-flight write for recovery', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'first.js'), 'const first = 1\n')
+  fs.writeFileSync(path.join(repo, 'second.js'), 'const second = 1\n')
+  writeUnitCatalog(repo)
+  await withSharedSettings(async (first, settingsDir) => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(first, parent, 1)
+    writerTurn(first, child, 1, 'first.js')
+    const agent = agentFor(repo, parent.id)
+    const attested = await first.attest(agent, {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'first.js', decision: 'mine' }],
+      reviewed_code_files: ['first.js'],
+      demonstrated_files: [{ path: 'first.js', note: 'ran the fixture' }],
+      adopted_files: ['first.js'],
+      items: [{ id: 'unit', state: 'passed' }], summary: 'Adopted the first write.',
+    })
+    assert.equal(attested.pass, true, 'precondition: the first write is attested')
+    writerTurn(first, child, 2, 'second.js', { end: false })
+    await first.disposeSession(parent.id, repo)
+    assert.ok(fs.readdirSync(first.changes.creditedDir).some(name => name.endsWith('.json')), 'disposal must retain the marker while a credited turn is still open')
+    const secondSvc = service({ settingsDir })
+    secondSvc.__testSettingsDir = settingsDir
+    parentIdleTurn(secondSvc, parent, 1)
+    secondSvc.publish(child, 'turn/end', { turn: 2 })
+    const report = await secondSvc.repositoryReport(agent)
+    assert.deepEqual(filesOf(report), [path.join(repo, 'first.js'), path.join(repo, 'second.js')], 'after restart and child turn end, both writes file')
+  })
+})
+
 // The other side of disposal: once a durable attestation covers the exact
 // writer turns and paths, disposal deletes the markers.
 test('parent disposal deletes markers once the attestation covers the child writes', async t => {
