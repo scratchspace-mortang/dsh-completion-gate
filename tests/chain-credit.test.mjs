@@ -294,6 +294,147 @@ test('an incomplete parent chain leaves coverage unknown rather than clean', asy
   } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
 })
 
+function writeUnitCatalog(repo) {
+  fs.mkdirSync(path.join(repo, '.dsh'), { recursive: true })
+  const stamp = '2026-11-07T00:00:00.000Z'
+  fs.writeFileSync(path.join(repo, '.dsh', 'verification.json'), `${JSON.stringify({ version: 1, items: [{ id: 'unit', name: 'Unit', proves: 'child.js works', addedAt: stamp, updatedAt: stamp }] }, null, 2)}\n`)
+}
+
+// F1: a credited file carries its writer; claiming it mine without a recorded
+// adoption is refused, and with an explicit adoption it is accepted.
+test('claiming a credited child write mine without adoption is refused, with adoption is accepted', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'child.js'), 'const child = 1\n')
+  writeUnitCatalog(repo)
+  const svc = service()
+  try {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, child, 1, 'child.js')
+    const agent = agentFor(repo, parent.id)
+    const base = {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'child.js', decision: 'mine' }],
+      reviewed_code_files: ['child.js'],
+      demonstrated_files: [{ path: 'child.js', note: 'ran the fixture' }],
+      items: [{ id: 'unit', state: 'passed' }], summary: 'Adopted the child write.',
+    }
+    await assert.rejects(svc.attest(agent, base), /adopt/i, 'a claim over another writer bytes without recorded adoption must be refused')
+    const accepted = await svc.attest(agent, { ...base, adopted_files: ['child.js'] })
+    assert.equal(accepted.pass, true, `attest with explicit adoption must pass: ${JSON.stringify(accepted.blockers)}`)
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+// F2: after restart, a resumed child write before the first repositoryReport
+// must not overwrite the retained marker with only its new path.
+test('a resumed child write before the first status keeps the earlier retained paths', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'first.js'), 'const first = 1\n')
+  fs.writeFileSync(path.join(repo, 'second.js'), 'const second = 1\n')
+  const first = service()
+  const parent = parentOf(repo)
+  const child = childOf(repo, parent.id, 'child-1', 1)
+  parentIdleTurn(first, parent, 1)
+  writerTurn(first, child, 1, 'first.js')
+  const settingsDir = first.__testSettingsDir
+  try {
+    const secondSvc = service({ settingsDir })
+    secondSvc.__testSettingsDir = settingsDir
+    parentIdleTurn(secondSvc, parent, 1)
+    writerTurn(secondSvc, child, 2, 'second.js')
+    const report = await secondSvc.repositoryReport(agentFor(repo, parent.id))
+    assert.deepEqual(filesOf(report), [path.join(repo, 'first.js'), path.join(repo, 'second.js')], 'both the retained and the resumed write file')
+  } finally { fs.rmSync(settingsDir, { recursive: true, force: true }) }
+})
+
+// F3: parent disposal before attestation must retain the descendant marker so
+// a restart recovers it.
+test('parent disposal before attestation retains the marker for a restart', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'kept.js'), 'const kept = 1\n')
+  const first = service()
+  const parent = parentOf(repo)
+  const child = childOf(repo, parent.id, 'child-1', 1)
+  parentIdleTurn(first, parent, 1)
+  writerTurn(first, child, 1, 'kept.js')
+  const settingsDir = first.__testSettingsDir
+  try {
+    first.disposeSession(parent.id)
+    const secondSvc = service({ settingsDir })
+    secondSvc.__testSettingsDir = settingsDir
+    parentIdleTurn(secondSvc, parent, 1)
+    const report = await secondSvc.repositoryReport(agentFor(repo, parent.id))
+    assert.deepEqual(filesOf(report), [path.join(repo, 'kept.js')], 'an unattested parent disposal must not delete the recoverable marker')
+  } finally { fs.rmSync(settingsDir, { recursive: true, force: true }) }
+})
+
+// F4: a late-arriving ancestor header must update the descendant marker, so a
+// restart still completes the chain.
+test('a late ancestor header updates the descendant marker before a restart', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'grandchild.js'), 'const grandchild = 1\n')
+  const first = service()
+  const parent = parentOf(repo)
+  const child = childOf(repo, parent.id, 'child-1', 1)
+  const grandchild = childOf(repo, child.id, 'grandchild-1', 2)
+  const settingsDir = first.__testSettingsDir
+  try {
+    // Grandchild writes before the intermediate child's header is ever seen.
+    writerTurn(first, grandchild, 1, 'grandchild.js')
+    // The ancestor header arrives late, completing the chain in memory.
+    first.publish(child, 'turn/start', { turn: 1 })
+    parentIdleTurn(first, parent, 1)
+    const before = await first.repositoryReport(agentFor(repo, parent.id))
+    assert.deepEqual(filesOf(before), [path.join(repo, 'grandchild.js')], 'precondition: the completed in-memory chain files')
+    const secondSvc = service({ settingsDir })
+    secondSvc.__testSettingsDir = settingsDir
+    parentIdleTurn(secondSvc, parent, 1)
+    const report = await secondSvc.repositoryReport(agentFor(repo, parent.id))
+    assert.deepEqual(filesOf(report), [path.join(repo, 'grandchild.js')], 'after restart the late ancestor must still complete the chain from the retained marker')
+  } finally { fs.rmSync(settingsDir, { recursive: true, force: true }) }
+})
+
+// F5a: coverage-unknown for an orphan writer must reach the stop advisory.
+test('stopping on an orphan writer names unknown coverage in the advisory', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'orphan.js'), 'const orphan = 1\n')
+  const svc = service()
+  try {
+    const parent = parentOf(repo)
+    const orphan = childOf(repo, 'missing-middle', 'orphan-1', 2)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, orphan, 1, 'orphan.js')
+    const agent = agentFor(repo, parent.id)
+    await svc.stopping({ agent, turn: 1 })
+    assert.equal(agent.steers.length, 1, 'the stop must speak about unknown coverage')
+    assert.match(agent.steers[0].content[0].text, /Coverage unknown/, 'the advisory must carry the coverage notice')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+// F5b: a corrupt retained marker must reach the stop advisory after restart.
+test('stopping with a corrupt retained marker names the retention loss in the advisory', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'corrupt.js'), 'const corrupt = 1\n')
+  const first = service()
+  const parent = parentOf(repo)
+  const child = childOf(repo, parent.id, 'child-1', 1)
+  parentIdleTurn(first, parent, 1)
+  writerTurn(first, child, 1, 'corrupt.js')
+  const settingsDir = first.__testSettingsDir
+  try {
+    const dir = first.changes.creditedDir
+    for (const marker of fs.readdirSync(dir)) fs.writeFileSync(path.join(dir, marker), '{ not json')
+    const secondSvc = service({ settingsDir })
+    secondSvc.__testSettingsDir = settingsDir
+    parentIdleTurn(secondSvc, parent, 1)
+    const agent = agentFor(repo, parent.id)
+    await secondSvc.stopping({ agent, turn: 1 })
+    assert.equal(agent.steers.length, 1, 'the stop must speak about the corrupt retained marker')
+    assert.match(agent.steers[0].content[0].text, /[Rr]etained|unknown/, 'the advisory must carry the retention/coverage notice')
+  } finally { fs.rmSync(settingsDir, { recursive: true, force: true }) }
+})
+
 // A corrupt retained marker is a known loss: the status names it as a warning
 // and coverage stays unknown.
 test('a corrupt retained marker is named as a warning with unknown coverage', async t => {

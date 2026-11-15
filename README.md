@@ -111,6 +111,7 @@ One attestation call covers one repository. The model calls the `completion_gate
 - `reviewed_code_files`: the changed code files the session claims as its own and has reviewed.
 - `docs_checked`: true when the session checked every changed documentation file it has not rejected for staleness, bloat, and conflicting information.
 - `demonstrated_files`: one entry per changed file the session demonstrated in real use, with `path` and a `note` of what was run, where it ran, and what it showed. An empty note is refused.
+- `adopted_files`: the changed files another session (a dispatched child writer) wrote that this session adopts as its own. Claiming such a file `mine`, or covering it with a review or a demonstration, without listing it here is refused; a file this session wrote itself needs no entry. The adoption is recorded on the file and survives until the repository reopens.
 - `items`: one state per catalog item, with `id` and `state` set to `passed`, `assumed`, or `unrelated`. An assumed item also carries a `reason`.
 - `summary`: an optional free-text note.
 
