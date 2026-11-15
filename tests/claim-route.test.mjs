@@ -486,6 +486,60 @@ test('regression: symlink claim resolves to the filed file', async t => {
   await assertClaimToComplete(svc, agent, repo, 'link.js', path.join(repo, 'real.js'))
 })
 
+test('regression: staged deletion claims with absent digest', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'gone.js'), 'export const gone = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'add gone'])
+  git(repo, ['rm', '-q', 'gone.js'])
+  assert.equal(git(repo, ['status', '--short']).trim(), 'D  gone.js', 'precondition: the deletion is staged')
+  assert.equal(git(repo, ['ls-files', 'gone.js']).trim(), '', 'precondition: the index entry is gone')
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  parentIdleTurn(svc, parent, 1)
+  const agent = agentFor(repo, parent.id)
+  const before = await svc.repositoryReport(agent)
+  assert.deepEqual(before.repositories, [], 'no record entry files nothing')
+  await assertClaimToComplete(svc, agent, repo, 'gone.js', path.join(repo, 'gone.js'))
+  const report = await svc.repositoryReport(agent)
+  const entry = report.repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, 'gone.js'))
+  assert.equal(entry.key, 'absent', 'the staged deletion keeps the absent digest')
+})
+
+test('regression: a never-tracked missing claim stays refused', async t => {
+  const repo = tempRepo()
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  parentIdleTurn(svc, parent, 1)
+  const agent = agentFor(repo, parent.id)
+  await assert.rejects(svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'typo.js', decision: 'mine' }],
+    items: [],
+  }), /typo\.js is not a changed file of this repository/, 'a typo name that git never tracked stays refused')
+})
+
+test('regression: a wildcard claim stays refused against a tracked matching file', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'missing1.js'), 'export const missing1 = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'add missing1'])
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  parentIdleTurn(svc, parent, 1)
+  const agent = agentFor(repo, parent.id)
+  await assert.rejects(svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'missing*.js', decision: 'mine' }],
+    items: [],
+  }), /missing\*\.js is not a changed file of this repository/, 'glob metacharacters never match a tracked file')
+  const report = await svc.repositoryReport(agent)
+  assert.deepEqual(report.repositories, [], 'the refused wildcard claim files nothing')
+})
+
 test('regression: deleted tracked file claims with absent digest', async t => {
   const repo = tempRepo()
   fs.writeFileSync(path.join(repo, 'deleted.js'), 'export const deleted = 1\n')
