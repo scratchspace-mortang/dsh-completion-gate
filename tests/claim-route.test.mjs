@@ -507,6 +507,28 @@ test('regression: staged deletion claims with absent digest', async t => {
   assert.equal(entry.key, 'absent', 'the staged deletion keeps the absent digest')
 })
 
+test('regression: staged deletion with a tab in the filename claims with absent digest', async t => {
+  const repo = tempRepo()
+  const tabName = 'tab\tname.js'
+  fs.writeFileSync(path.join(repo, tabName), 'export const tab = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'add tab file'])
+  git(repo, ['rm', '-q', tabName])
+  assert.equal(git(repo, ['ls-files', tabName]).trim(), '', 'precondition: the index entry is gone')
+  assert.ok(git(repo, ['ls-tree', '-z', 'HEAD', '--', tabName]).includes(`\t${tabName}\0`), 'precondition: the HEAD tree still names the tab file')
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  parentIdleTurn(svc, parent, 1)
+  const agent = agentFor(repo, parent.id)
+  const before = await svc.repositoryReport(agent)
+  assert.deepEqual(before.repositories, [], 'no record entry files nothing')
+  await assertClaimToComplete(svc, agent, repo, tabName, path.join(repo, tabName))
+  const report = await svc.repositoryReport(agent)
+  const entry = report.repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, tabName))
+  assert.equal(entry.key, 'absent', 'the staged deletion keeps the absent digest')
+})
+
 test('regression: a never-tracked missing claim stays refused', async t => {
   const repo = tempRepo()
   const svc = service()
