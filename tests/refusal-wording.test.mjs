@@ -227,6 +227,57 @@ test('a review-only refusal names the claim route, and the claim-carrying attest
   assert.deepEqual(accepted.blockers, [], 'the claim-carrying attest has no blockers')
 })
 
+// A review, demonstration, or adoption entry over an existing file in another
+// repository must not promise the claim route against the selected root: the
+// claim route files under the owning root, so a claim against the selected
+// root still refuses. The refusal names the owning root as the correct
+// target, and an attest against that root files and completes the file.
+test('a cross-repository entry names the owning root instead of promising the claim route', async t => {
+  const repo = tempRepo()
+  const other = tempRepo()
+  const otherFile = path.join(other, 'other.js')
+  fs.writeFileSync(otherFile, 'export const other = 1\n')
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  const agent = agentFor(repo, parent.id)
+  const entryArgs = [
+    { reviewed_code_files: [otherFile] },
+    { demonstrated_files: [{ path: otherFile, note: 'ran the fixture' }] },
+    { adopted_files: [otherFile] },
+  ]
+  for (const extra of entryArgs) {
+    const refusal = await svc.attest(agent, {
+      action: 'attest', repository_root: repo, ...extra,
+    }).then(() => null, e => e)
+    assert.ok(refusal, `a cross-repository entry must refuse: ${JSON.stringify(extra)}`)
+    const message = refusal.message
+    assert.match(message, /is not a changed file of this repository\./, 'the refusal still names the path as unfiled')
+    assert.match(message, /No filed record names it/, 'the refusal names the condition')
+    assert.ok(message.includes(other), `the refusal names the owning root ${other}: ${message}`)
+    assert.match(message, /claim against this repository cannot file it/, 'the refusal states a claim against the selected root cannot file it')
+    assert.match(message, /attest against/, 'the refusal names the correct target')
+    assert.doesNotMatch(message, /Add it to claims instead/, 'the refusal never promises the claim route against the selected root')
+    assert.doesNotMatch(message, /a claim is the route that files it/, 'the refusal never calls the claim route the filing route')
+  }
+  const claimRefusal = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: otherFile, decision: 'mine' }],
+    reviewed_code_files: [otherFile],
+    demonstrated_files: [{ path: otherFile, note: 'ran the fixture' }],
+  }).then(() => null, e => e)
+  assert.ok(claimRefusal, 'a claim against the selected root over a foreign file must refuse')
+  assert.ok(claimRefusal.message.includes(other), `the claim refusal names the owning root: ${claimRefusal.message}`)
+  const accepted = await svc.attest(agent, {
+    action: 'attest', repository_root: other,
+    claims: [{ path: otherFile, decision: 'mine' }],
+    reviewed_code_files: [otherFile],
+    demonstrated_files: [{ path: otherFile, note: 'ran the fixture' }],
+    summary: 'The owning root files the path.',
+  })
+  assert.equal(accepted.pass, true, `an attest against the owning root completes: ${JSON.stringify(accepted.blockers)}`)
+})
+
 // A review-only refusal over a typo name (no file on disk, never tracked) must
 // not promise the claim route, because the claim route refuses that name too
 // (stagedAttest skips a missing name git never tracked). It takes the same
