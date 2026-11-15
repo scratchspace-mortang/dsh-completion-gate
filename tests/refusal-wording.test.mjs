@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { CompletionGateService } from '../lib/index.js'
+import { gitRootOf } from '../lib/repositories.js'
 import { userMessage } from './user-message.mjs'
 
 // Refusal wording and retention naming (ticket kxeh): an unfiled path in an
@@ -49,8 +50,9 @@ function service() {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'cg-refusal-settings-')))
   const listeners = new Map()
   const off = () => () => {}
+  const rec = recorder()
   const ctx = {
-    reflect: { get: name => (name === 'workspaceChanges' ? recorder() : undefined) },
+    reflect: { get: name => (name === 'workspaceChanges' ? rec : undefined) },
     on: (name, listener) => { listeners.set(name, listener); return off() },
     provide: off, tools: { register: off }, commands: { register: off }, systemPrompt: { section: off }, webServer: { register: off },
   }
@@ -88,6 +90,18 @@ function writerTurn(svc, writer, turn, file) {
 function parentIdleTurn(svc, parent, turn) {
   svc.publish(parent, 'turn/start', { turn })
   svc.publish(parent, 'user/message', userMessage(parent.id, turn))
+  svc.publish(parent, 'turn/end', { turn })
+}
+
+const file = p => ({ path: p, display: p, added: 1, deleted: 0 })
+
+function announceParentTurn(svc, parent, turn, files, cwd, calls = files.map(entry => entry.path)) {
+  const id = parent.id
+  svc.publish(parent, 'turn/start', { turn })
+  svc.publish(parent, 'user/message', userMessage(id, turn))
+  for (const call of calls) svc.publish(parent, 'tool/call', { turn, name: 'write', arguments: JSON.stringify({ file_path: call, content: 'x\n' }) })
+  svc.publish(parent, 'workspace/changes', { turn })
+  svc.changeService().entries.set(`${id}:${published}`, { turn, cwd, files, total: files.length, added: files.length, deleted: 0 })
   svc.publish(parent, 'turn/end', { turn })
 }
 
@@ -301,4 +315,62 @@ test('a review-only refusal over a nonexistent untracked path does not promise t
   assert.doesNotMatch(message, /Add it to claims instead/, 'the refusal never promises the claim route it cannot keep')
   assert.doesNotMatch(message, /a claim is the route that files it/, 'the refusal never calls the claim route the filing route')
   assert.doesNotMatch(message, /touch/i, 'the refusal never suggests touching a file')
+})
+
+// An ownerless existing file (no git root above it) files under the fallback
+// cwd, not the selected root, when the two differ. A review-only entry under
+// the selected root must not promise the claim route there: it names the
+// fallback cwd as the target, a claim against the selected root still
+// refuses, and an attest against the fallback cwd files and completes.
+test('an ownerless file names the fallback cwd instead of promising the claim route under a differing selected root', async t => {
+  const selected = tempRepo()
+  const cwdRepo = tempRepo()
+  const ownerlessDir = makeWorkDir('cg-ownerless-')
+  const ownerless = path.join(ownerlessDir, 'ownerless.js')
+  fs.writeFileSync(ownerless, 'export const ownerless = 1\n')
+  assert.equal(await gitRootOf(ownerless), null, 'precondition: the file has no owning git repository')
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(cwdRepo)
+  announceParentTurn(svc, parent, 1, [file('app.js')], selected)
+  const agent = agentFor(cwdRepo, parent.id)
+  const seen = await svc.repositoryReport(agent)
+  assert.ok(seen.repositories.some(r => r.root === selected), 'precondition: the selected repository is seen')
+
+  const refusal = await svc.attest(agent, {
+    action: 'attest', repository_root: selected,
+    reviewed_code_files: [ownerless],
+  }).then(() => null, e => e)
+  assert.ok(refusal, 'a review-only attest over the ownerless file under the selected root must refuse')
+  const message = refusal.message
+  assert.match(message, /is not a changed file of this repository\./, 'the refusal still names the path as unfiled')
+  assert.match(message, /No filed record names it/, 'the refusal names the condition')
+  assert.ok(message.includes(cwdRepo), `the refusal names the fallback cwd ${cwdRepo}: ${message}`)
+  assert.match(message, /claim against this repository cannot file it/, 'the refusal states a claim against the selected root cannot file it')
+  assert.match(message, /attest against/, 'the refusal names the correct target')
+  assert.doesNotMatch(message, /Add it to claims instead/, 'the refusal never promises the claim route against the selected root')
+  assert.doesNotMatch(message, /a claim is the route that files it/, 'the refusal never calls the claim route the filing route')
+  assert.doesNotMatch(message, /touch/i, 'the refusal never suggests touching a file')
+
+  const claimRefusal = await svc.attest(agent, {
+    action: 'attest', repository_root: selected,
+    claims: [{ path: ownerless, decision: 'mine' }],
+    reviewed_code_files: [ownerless],
+    demonstrated_files: [{ path: ownerless, note: 'ran the fixture' }],
+  }).then(() => null, e => e)
+  assert.ok(claimRefusal, 'a claim against the selected root over the ownerless file must refuse')
+  assert.ok(claimRefusal.message.includes(cwdRepo), `the claim refusal names the fallback cwd: ${claimRefusal.message}`)
+  assert.match(claimRefusal.message, /claim cannot file it under this repository/, 'the claim refusal names the fallback as the filing root')
+
+  const accepted = await svc.attest(agent, {
+    action: 'attest', repository_root: cwdRepo,
+    claims: [{ path: ownerless, decision: 'mine' }],
+    reviewed_code_files: [ownerless],
+    demonstrated_files: [{ path: ownerless, note: 'ran the fixture' }],
+    summary: 'The fallback cwd files the ownerless path.',
+  })
+  assert.equal(accepted.pass, true, `an attest against the fallback cwd completes: ${JSON.stringify(accepted.blockers)}`)
+  assert.deepEqual(accepted.blockers, [], 'the fallback attest has no blockers')
+  const report = await svc.repositoryReport(agent)
+  assert.ok(report.repositories.some(r => r.root === cwdRepo && r.files.some(f => f.absolute === ownerless && f.claim === 'mine')), 'the ownerless file files under the fallback cwd')
 })
