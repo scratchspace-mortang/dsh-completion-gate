@@ -133,60 +133,72 @@ export async function realDispatch({ checkout, repo, settingsDir, childFile, chi
     }
   }
 
-  const ctx = new Context()
-  await mountAgentLoopTestDependencies(ctx)
-  await ctx.plugin(AgentLoop, { agents: [] })
-  await ctx.plugin(SubagentRuntime)
-  await ctx.plugin(SpawnInProcess, { providerName: 'spawn' })
-  await ctx.plugin(ToolSubagent, { provider: 'spawn' })
-  await ctx.plugin(LocalFileSystem, { cwd: repo })
-  await ctx.plugin(FsPolicy)
-  await ctx.plugin(ToolFs)
-  await ctx.plugin(Commands)
-  await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
-  // The gate plugin's `apply` derives its settings path from DSH_STATE_HOME
-  // at construction, so point that at the caller's fresh settings directory
-  // for the mount and restore the caller's value afterwards.
-  const previousStateHome = process.env.DSH_STATE_HOME
-  process.env.DSH_STATE_HOME = settingsDir
-  try { await ctx.plugin(GatePlugin, {}) }
-  finally {
-    if (previousStateHome === undefined) delete process.env.DSH_STATE_HOME
-    else process.env.DSH_STATE_HOME = previousStateHome
+  async function assemble(ctx) {
+    await mountAgentLoopTestDependencies(ctx)
+    await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(SpawnInProcess, { providerName: 'spawn' })
+    await ctx.plugin(ToolSubagent, { provider: 'spawn' })
+    await ctx.plugin(LocalFileSystem, { cwd: repo })
+    await ctx.plugin(FsPolicy)
+    await ctx.plugin(ToolFs)
+    await ctx.plugin(Commands)
+    await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
+    // The gate plugin's `apply` derives its settings path from DSH_STATE_HOME
+    // at construction, so point that at the caller's fresh settings directory
+    // for the mount and restore the caller's value afterwards.
+    const previousStateHome = process.env.DSH_STATE_HOME
+    process.env.DSH_STATE_HOME = settingsDir
+    try { await ctx.plugin(GatePlugin, {}) }
+    finally {
+      if (previousStateHome === undefined) delete process.env.DSH_STATE_HOME
+      else process.env.DSH_STATE_HOME = previousStateHome
+    }
+
+    const adapter = new ScriptedAdapter([
+      toolCallResponse('call-subagent', 'subagent', { description: 'child write', prompt: `Write ${childFile} in the repository.`, run_in_background: false }, ToolCallId),
+      toolCallResponse('call-write', 'write', { file_path: childFile, content: childContent }, ToolCallId),
+      textResponse('child done'),
+      textResponse('parent done'),
+      textResponse('parent done again'),
+      textResponse('parent done once more'),
+      toolCallResponse('call-stranger-write', 'write', { file_path: strangerFile, content: strangerContent }, ToolCallId),
+      textResponse('stranger done'),
+      textResponse('stranger done again'),
+      textResponse('stranger done once more'),
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
+
+    const observed = []
+    ctx.on('session/event', (session, event) => {
+      observed.push({ sessionId: session.id, type: event.type, turn: event.data?.turn, name: event.data?.name, parentSession: session.header?.parentSession, origin: session.header?.origin, delegationDepth: session.header?.delegationDepth, cwd: session.header?.cwd })
+    })
+
+    const parent = await ctx.agentLoop.create(SessionId('parent'), { provider: 'mock', model: 'mock' }, { cwd: repo })
+    const parentIdle = waitIdle(ctx, parent)
+    parent.followup(createUserMessage({ content: [{ type: 'text', text: 'delegate the child write' }], source: { kind: 'user' } }))
+    await parentIdle
+
+    const stranger = await ctx.agentLoop.create(SessionId('stranger'), { provider: 'mock', model: 'mock' }, { cwd: repo })
+    const strangerIdle = waitIdle(ctx, stranger)
+    stranger.followup(createUserMessage({ content: [{ type: 'text', text: 'write the stranger file' }], source: { kind: 'user' } }))
+    await strangerIdle
+
+    const childWrite = observed.find(event => event.type === 'tool/call' && event.name === 'write' && event.sessionId !== parent.id && event.sessionId !== stranger.id)
+    // Disposing the root fiber unloads every mounted plugin (including the
+    // listening WebServer service), so a suite test that mounts this assembly
+    // must call it before returning or its process never exits.
+    return { ctx, parent, stranger, childId: childWrite?.sessionId, observed, adapter, ToolCallId, dispose: () => ctx.fiber.dispose() }
   }
 
-  const adapter = new ScriptedAdapter([
-    toolCallResponse('call-subagent', 'subagent', { description: 'child write', prompt: `Write ${childFile} in the repository.`, run_in_background: false }, ToolCallId),
-    toolCallResponse('call-write', 'write', { file_path: childFile, content: childContent }, ToolCallId),
-    textResponse('child done'),
-    textResponse('parent done'),
-    textResponse('parent done again'),
-    textResponse('parent done once more'),
-    toolCallResponse('call-stranger-write', 'write', { file_path: strangerFile, content: strangerContent }, ToolCallId),
-    textResponse('stranger done'),
-    textResponse('stranger done again'),
-    textResponse('stranger done once more'),
-  ])
-  ctx.llm.registerAdapter(['mock'], adapter)
-
-  const observed = []
-  ctx.on('session/event', (session, event) => {
-    observed.push({ sessionId: session.id, type: event.type, turn: event.data?.turn, name: event.data?.name, parentSession: session.header?.parentSession, origin: session.header?.origin, delegationDepth: session.header?.delegationDepth, cwd: session.header?.cwd })
-  })
-
-  const parent = await ctx.agentLoop.create(SessionId('parent'), { provider: 'mock', model: 'mock' }, { cwd: repo })
-  const parentIdle = waitIdle(ctx, parent)
-  parent.followup(createUserMessage({ content: [{ type: 'text', text: 'delegate the child write' }], source: { kind: 'user' } }))
-  await parentIdle
-
-  const stranger = await ctx.agentLoop.create(SessionId('stranger'), { provider: 'mock', model: 'mock' }, { cwd: repo })
-  const strangerIdle = waitIdle(ctx, stranger)
-  stranger.followup(createUserMessage({ content: [{ type: 'text', text: 'write the stranger file' }], source: { kind: 'user' } }))
-  await strangerIdle
-
-  const childWrite = observed.find(event => event.type === 'tool/call' && event.name === 'write' && event.sessionId !== parent.id && event.sessionId !== stranger.id)
-  // Disposing the root fiber unloads every mounted plugin (including the
-  // listening WebServer service), so a suite test that mounts this assembly
-  // must call it before returning or its process never exits.
-  return { ctx, parent, stranger, childId: childWrite?.sessionId, observed, adapter, ToolCallId, dispose: () => ctx.fiber.dispose() }
+  const ctx = new Context()
+  try {
+    return await assemble(ctx)
+  } catch (error) {
+    // A pre-return failure must not leave the listening WebServer (or any
+    // other mounted plugin) holding this process open: the caller never got
+    // the dispose handle, so dispose the root fiber here and rethrow.
+    try { await ctx.fiber.dispose() } catch {}
+    throw error
+  }
 }

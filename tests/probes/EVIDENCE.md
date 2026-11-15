@@ -117,10 +117,17 @@ listening WebServer service, so the harness returns `dispose`
 (`ctx.fiber.dispose()`, which unloads every mounted plugin) and the test
 calls it in a `finally` block; without it the test passed but its process
 never exited, which wedged `npm test` at 0% CPU. The probe never showed
-this because it ends with `process.exit`. Complexity on the changed files
-(`cccc`/`lizard`): the largest function touched is `realDispatch` at
-cognitive 2; file peaks are 13 (step-two probe), 11 (dispatch harness), and
-4 (real-store test), all far under the cognitive 36 cap.
+this because it ends with `process.exit`. The same hazard applies to a
+pre-return failure (a gate mount or turn that throws after the WebServer
+listens): `realDispatch` disposes the root fiber itself before rethrowing,
+and the step-two probe wraps its post-return status and assertion work in
+`try/finally`, so a failure reports instead of hanging. This was confirmed
+with a bounded fault injection (the gate service `start()` patched to throw
+after the WebServer mounted): the error was caught and the process exited
+on its own. Complexity on the changed files (`cccc`/`lizard`): the largest
+function touched is `realDispatch` at cognitive 3; file peaks are 13
+(step-two probe), 14 (dispatch harness), and 4 (real-store test), all far
+under the cognitive 36 cap.
 
 ## What this fix replaced
 
