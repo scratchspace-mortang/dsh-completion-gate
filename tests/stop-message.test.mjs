@@ -1892,6 +1892,29 @@ test('held notices are marked as hold-time when they are replayed, not claimed a
   assert.match(text, /could not read its HEAD at the silenced stop/, `the replayed notice must name the silenced stop, not the speaking stop: ${text}`)
   assert.doesNotMatch(text, /HEAD at this stop/, `the replayed notice must not claim the failure happened at the speaking stop: ${text}`)
   assertAdvisory(text)
+
+  // Review round 3 P3 (persistent notice): the nested HEAD stays broken through
+  // the next at-hour stop, so the held notice is re-observed as a current one.
+  // The same fact must print once, with the current wording, never twice, and a
+  // fresh notice keeps its wording (never the hold-time prefix).
+  fs.writeFileSync(headPath, 'ref: refs/heads/missing-for-test\n')
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 2, 'precondition: the persistent notice is held again inside the hour')
+  pastHour(svc, agent)
+  begin(svc, agent, 7)
+  prompt(svc, agent, 7)
+  announce(svc, agent, { turn: 7, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 7)
+  assert.equal(agent.steers.length, 3, 'the persistent notice must speak at the hour')
+  const persistent = steerText(agent.steers[2])
+  const headLines = persistent.split('\n').filter(line => line.includes('could not read its HEAD'))
+  assert.equal(headLines.length, 1, `a notice whose condition persists must print exactly once: ${persistent}`)
+  assert.ok(headLines[0].includes('could not read its HEAD at this stop'), `a recurring fact prints with current wording: ${persistent}`)
+  assert.doesNotMatch(persistent, /At the silenced stop: Nested repository/, `a recurring fact must not print with the hold-time prefix: ${persistent}`)
+  assertAdvisory(persistent)
 })
 
 // Review round 2 P3 (mutant M3): a credential-only stop silenced by the
