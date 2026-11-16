@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CompletionGateService } from '../lib/index.js'
+import { advisoryMessage, registerMarkdown, repositoriesMarkdown } from '../lib/report.js'
 import { userMessage } from './user-message.mjs'
 
 // The stop message of ticket personal#3nm5. At a stop the gate sends at most one advisory steer, covering every repository
@@ -1064,6 +1065,154 @@ test('a silent stop carries an unread-file notice the next prompt cannot read ag
   const text = steerText(agent.steers[1])
   assert.match(text, /1 changed file could not be read for this scan/, `the kept unread file must be named at the next prompt: ${text}`)
   assert.match(text, /- app\.js: transient read failure$/m, 'the kept unread file must be named by its path')
+})
+
+// Ticket personal#9v2n (catalog-spam C2, invariant I3): status/attest catalog sections print the catalog path, the
+// archive path, and the active count, and never an unstated item's name, proves, or command text. Stated session
+// items keep their individual lines.
+const CATALOG_SPAM_ROOT = '/home/wilder/Trash/catalog-spam-report-tests'
+function reportPaths() {
+  const catalogPath = path.join(CATALOG_SPAM_ROOT, '.dsh', 'verification.json')
+  const archivePath = path.join(CATALOG_SPAM_ROOT, '.dsh', 'verification-archive.json')
+  return { catalogPath, archivePath }
+}
+function reportRepo({ catalog, items = [], unstatedCount = 0 } = {}) {
+  const { catalogPath } = reportPaths()
+  return {
+    label: 'repo', root: CATALOG_SPAM_ROOT, catalogPath,
+    files: [], unclaimed: [], unreviewed: [], docsUnchecked: [], undemonstrated: [],
+    catalog, items, unstatedCount, attestation: null, stale: false, introduced: true,
+    problems: [], complete: false,
+  }
+}
+function readableCatalog() {
+  const { catalogPath } = reportPaths()
+  const stamp = '2026-11-07T00:00:00.000Z'
+  return {
+    path: catalogPath, state: 'readable', problem: null,
+    items: [
+      { id: 'unit', name: 'Stated unit name', proves: 'STATED-PROVES-ONE', command: 'node stated-one.js', addedAt: stamp, updatedAt: stamp },
+      { id: 'secret-one', name: 'Unstated secret one name', proves: 'UNSTATED-PROVES-ONE', command: 'node unstated-one.js', addedAt: stamp, updatedAt: stamp },
+      { id: 'secret-two', name: 'Unstated secret two name', proves: 'UNSTATED-PROVES-TWO', command: 'node unstated-two.js', addedAt: stamp, updatedAt: stamp },
+    ],
+  }
+}
+
+test('ticket 1: a readable catalog prints both paths and the count, the stated item, and no unstated item text', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({
+    catalog: readableCatalog(),
+    items: [{ id: 'unit', name: 'Stated unit name', state: 'passed' }],
+    unstatedCount: 2,
+  })
+  const text = repositoriesMarkdown({ turn: 1, notices: [], repositories: [repo] })
+  assert.ok(text.includes(catalogPath), `the catalog path must be printed: ${text}`)
+  assert.ok(text.includes(archivePath), `the archive path must be printed: ${text}`)
+  assert.ok(text.includes('Active catalog items: 3'), `the active count must be printed: ${text}`)
+  assert.ok(text.includes('- unit: Stated unit name | passed'), `the stated item keeps its line: ${text}`)
+  for (const secret of ['Unstated secret one name', 'Unstated secret two name', 'UNSTATED-PROVES-ONE', 'UNSTATED-PROVES-TWO', 'node unstated-one.js', 'node unstated-two.js', 'secret-one', 'secret-two']) {
+    assert.ok(!text.includes(secret), `no unstated item text may be printed (${secret}): ${text}`)
+  }
+  assert.doesNotMatch(text, /STATED-PROVES-ONE|node stated-one\.js/, 'even the stated item proves and command text stay out of the catalog section')
+})
+
+test('ticket 1: a stated archived item keeps its line while the active catalog is only counted', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const stamp = '2026-11-07T00:00:00.000Z'
+  const catalog = {
+    path: catalogPath, state: 'readable', problem: null,
+    items: [{ id: 'fresh', name: 'Fresh unstated name', proves: 'FRESH-UNSTATED-PROVES', command: 'node fresh.js', addedAt: stamp, updatedAt: stamp }],
+  }
+  const repo = reportRepo({
+    catalog,
+    items: [{ id: 'old', name: 'Archived stated name', state: 'passed' }],
+    unstatedCount: 1,
+  })
+  const status = repositoriesMarkdown({ turn: 1, notices: [], repositories: [repo] })
+  assert.ok(status.includes('- old: Archived stated name | passed'), `the stated archived item keeps its status line: ${status}`)
+  assert.ok(status.includes(catalogPath) && status.includes(archivePath), `both paths must be printed: ${status}`)
+  assert.ok(status.includes('Active catalog items: 1'), `the active count must be printed: ${status}`)
+  assert.ok(!status.includes('Fresh unstated name') && !status.includes('FRESH-UNSTATED-PROVES') && !status.includes('node fresh.js'), `the unstated active item text must not be printed: ${status}`)
+  const advisory = advisoryMessage({ repositories: [repo] })
+  assert.ok(advisory.includes(catalogPath) && advisory.includes(archivePath), `the advisory must gain both path lines: ${advisory}`)
+  assert.ok(advisory.includes('- Archived stated name (old): passed'), `the advisory keeps the stated archived item: ${advisory}`)
+  assert.ok(!advisory.includes('Fresh unstated name'), `the advisory must not list the unstated item: ${advisory}`)
+})
+
+test('ticket 1: an absent catalog prints both paths and a zero count', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'absent', items: [], problem: null } })
+  const text = repositoriesMarkdown({ turn: 1, notices: [], repositories: [repo] })
+  assert.ok(text.includes(catalogPath) && text.includes(archivePath), `both paths must be printed for an absent catalog: ${text}`)
+  assert.ok(text.includes('Active catalog items: 0'), `an absent catalog counts zero active items: ${text}`)
+  assert.match(text, /No catalog exists yet/, 'the absent catalog still says so')
+})
+
+test('ticket 1: an unreadable catalog prints both paths and its problem, never as readable', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'unreadable', items: [], problem: 'the file is not valid JSON: boom' } })
+  const text = repositoriesMarkdown({ turn: 1, notices: [], repositories: [repo] })
+  assert.ok(text.includes(catalogPath) && text.includes(archivePath), `both paths must be printed for an unreadable catalog: ${text}`)
+  assert.match(text, /Catalog unreadable, so its items are not listed: the file is not valid JSON: boom/, 'the unreadable problem line is kept')
+  assert.doesNotMatch(text, /Catalog readable, with no items yet/, 'an unreadable catalog is never shown as readable and empty')
+})
+
+test('ticket 1: an empty catalog prints both paths and a zero count', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'readable', items: [], problem: null } })
+  const text = repositoriesMarkdown({ turn: 1, notices: [], repositories: [repo] })
+  assert.ok(text.includes(catalogPath) && text.includes(archivePath), `both paths must be printed for an empty catalog: ${text}`)
+  assert.ok(text.includes('Active catalog items: 0'), `an empty catalog counts zero active items: ${text}`)
+  assert.match(text, /Catalog readable, with no items yet/, 'an empty readable catalog still says so')
+})
+
+test('ticket 1: register markdown with an archive problem names the path and problem with no success indication', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const text = registerMarkdown({
+    path: catalogPath,
+    items: [],
+    exclusion: { applied: false, reason: 'the root is not a git repository' },
+    archive: { path: archivePath, moved: [], problem: 'cannot write the archive file: EIO' },
+  })
+  assert.ok(text.includes(catalogPath), `the catalog path must be named: ${text}`)
+  assert.ok(text.includes(archivePath), `the archive path must be named: ${text}`)
+  assert.ok(text.includes('cannot write the archive file: EIO'), `the archive problem must be named: ${text}`)
+  assert.doesNotMatch(text, /registered|updated/, 'a refused register shows no success indication')
+})
+
+test('ticket 1: register markdown without an archive problem names the archive path', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const text = registerMarkdown({
+    path: catalogPath,
+    items: [{ id: 'unit', name: 'Unit', created: true }],
+    exclusion: { applied: false, reason: 'the root is not a git repository' },
+    archive: { path: archivePath, moved: [], problem: null },
+  })
+  assert.ok(text.includes(archivePath), `the archive path must be named: ${text}`)
+  assert.ok(text.includes('- unit: Unit (registered)'), `a successful register still lists its items: ${text}`)
+})
+
+test('ticket 1: the stop advisory prints both paths, the stated item, and no unstated item name', async () => {
+  const repo = changedRepo('catalog-spam-advisory')
+  writeCatalog(repo, ['unit', 'smoke'])
+  fs.writeFileSync(path.join(repo, 'other.js'), 'const other = 1\n')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent)
+  announce(svc, agent, { cwd: repo, files: ['app.js', 'other.js'] })
+  await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  await stop(svc, agent)
+  assert.equal(agent.steers.length, 1)
+  const text = steerText(agent.steers[0])
+  assert.ok(text.includes(path.join(repo, '.dsh', 'verification.json')), `the advisory must print the catalog path: ${text}`)
+  assert.ok(text.includes(path.join(repo, '.dsh', 'verification-archive.json')), `the advisory must print the archive path: ${text}`)
+  assert.ok(text.includes('- unit (unit): passed'), `the stated item keeps its advisory line: ${text}`)
+  assert.doesNotMatch(text, /smoke/, 'the unstated item name must not appear in the advisory')
 })
 
 // The turn's changed lines are readable even when the repository report throws, so a credential in them is named now
