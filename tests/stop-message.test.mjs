@@ -1787,6 +1787,239 @@ test('credential bypass: a credential speak restarts the hour, so a later non-cr
   assert.ok(steerText(agent.steers[2]).includes(`Root: ${repo}`), 'the spoken held advisory must name the repository')
 })
 
+// Review round 2 P2 (gap-only erasure): a stop inside the hour whose only
+// advisory content is an unread file must not overwrite the advisory facts an
+// earlier stop held. The gap is kept in heldGaps, as before; the held facts
+// must still speak at the hour.
+test('hourly throttle: a gap-only stop inside the hour preserves the held advisory facts', async () => {
+  const repo = changedRepo('hourly-gap-only')
+  writeCatalog(repo, ['unit'])
+  const changes = recorder()
+  let failing = false
+  changes.diff = async () => (failing ? Promise.reject(new Error('transient read failure')) : { kind: 'text', hunks: [{ lines: [] }] })
+  const svc = service({ workspaceChanges: changes })
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and starts the hour')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'held-facts-reason' }] })
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'precondition: the held advisory stays silent inside the hour')
+  const completed = await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(completed.pass, true, `precondition: the repository must be complete, so the gap-only stop has no advisory facts: ${completed.problems.join(' | ')}`)
+  failing = true
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 1, 'a gap-only stop inside the hour must stay silent')
+  failing = false
+  pastHour(svc, agent)
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 2, 'the held advisory must speak at the hour')
+  const text = steerText(agent.steers[1])
+  assert.ok(text.includes('held-facts-reason'), `the gap-only stop must not erase the held advisory facts: ${text}`)
+  assert.match(text, /1 changed file could not be read for this scan/, `the unread file must still be named at the hour: ${text}`)
+  assert.match(text, /- app\.js: transient read failure$/m, 'the kept unread file must be named by its path')
+})
+
+// Review round 2 P3 (held notice wording): a held nested-HEAD notice is a
+// fact from the silenced stop, so its replay must not claim the failure
+// happened at the speaking stop.
+test('held notices are marked as hold-time when they are replayed, not claimed as current', async () => {
+  const repo = changedRepo('notice-held')
+  writeCatalog(repo, ['unit'])
+  const child = path.join(repo, 'nested')
+  fs.mkdirSync(child)
+  git(child, ['init', '-q', '.'])
+  git(child, ['config', 'user.email', 'test@example.com'])
+  git(child, ['config', 'user.name', 'test'])
+  fs.writeFileSync(path.join(child, 'lib.js'), 'module.exports = 1\n')
+  git(child, ['add', '-A'])
+  git(child, ['commit', '-qm', 'child'])
+  writeCatalog(child, ['unit'])
+  const headPath = path.join(child, '.git', 'HEAD')
+  const head = fs.readFileSync(headPath, 'utf8')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js', child] })
+  const childDone = await svc.attest(agent, {
+    repository_root: child,
+    claims: [{ path: '.', decision: 'mine' }],
+    reviewed_code_files: ['.'], demonstrated_files: [{ path: '.', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(childDone.pass, true, `precondition: the nested repository must be complete: ${childDone.problems.join(' | ')}`)
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the parent advisory speaks and starts the hour')
+  fs.writeFileSync(headPath, 'ref: refs/heads/missing-for-test\n')
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'a stop inside the hour must stay silent and hold the nested-HEAD notice')
+  fs.writeFileSync(headPath, head)
+  const parentDone = await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(parentDone.pass, true, `precondition: the parent repository must be complete, so the held notice is the only payload: ${parentDone.problems.join(' | ')}`)
+  pastHour(svc, agent)
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 2, 'the held notice must speak at the hour')
+  const text = steerText(agent.steers[1])
+  assert.match(text, /At the silenced stop: Nested repository/, `the replayed notice must be marked as hold-time: ${text}`)
+  assert.match(text, /could not read its HEAD at the silenced stop/, `the replayed notice must name the silenced stop, not the speaking stop: ${text}`)
+  assert.doesNotMatch(text, /HEAD at this stop/, `the replayed notice must not claim the failure happened at the speaking stop: ${text}`)
+  assertAdvisory(text)
+})
+
+// Review round 2 P3 (mutant M3): a credential-only stop silenced by the
+// prompt bound must not overwrite the advisory facts an earlier stop held,
+// because credentials are not advisory facts.
+test('a credential-only prompt-silenced stop preserves the held advisory facts', async () => {
+  const repo = changedRepo('credential-only-preserves')
+  writeCatalog(repo, ['unit'])
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and arms the prompt bound')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'held-facts-reason' }] })
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the same-prompt stop stays silent and holds the facts')
+  const completed = await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(completed.pass, true, `precondition: the repository must be complete, so the credential-only stop has no advisory facts: ${completed.problems.join(' | ')}`)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'], diffs: [['+password = "hunter2hunter2"']] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'the credential-only prompt-silenced stop must stay silent')
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 2, 'the held credential must speak at the next prompt-eligible stop')
+  const text = steerText(agent.steers[1])
+  assert.ok(text.includes('held-facts-reason'), `the credential-only stop must not erase the held advisory facts: ${text}`)
+  assert.match(text, /Possible hard-coded credential or secret/, 'the held credential must be named')
+  assert.doesNotMatch(text, /hunter2/, 'the matched value must never be written into the message')
+})
+
+// Review round 2 P3 (mutant M4): speaking the held facts clears them, so the
+// next prompt never replays already-spoken held facts.
+test('a spoken held advisory is cleared, so the next prompt does not replay the held facts', async () => {
+  const repo = changedRepo('held-no-replay')
+  writeCatalog(repo, ['unit'])
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and starts the hour')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'held-facts-reason' }] })
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'precondition: the held advisory stays silent inside the hour')
+  const completed = await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(completed.pass, true, `precondition: the repository must be complete, so the at-hour stop has no advisory of its own: ${completed.problems.join(' | ')}`)
+  pastHour(svc, agent)
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 2, 'precondition: the held advisory speaks at the hour')
+  assert.ok(steerText(agent.steers[1]).includes('held-facts-reason'), 'precondition: the spoken advisory carried the held facts')
+  pastHour(svc, agent)
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 2, 'the next prompt must not replay held facts that already spoke')
+})
+
+// Review round 2 P3 (mutant M5): a repository shown only as a historical
+// held snapshot was never shown its introduction, so it must not be marked
+// introduced, and its first current advisory carries the introduction.
+test('a historical held repository is not marked introduced when its held facts speak', async () => {
+  const repoA = changedRepo('intro-held-a')
+  writeCatalog(repoA, ['unit'])
+  const repoB = changedRepo('intro-held-b')
+  writeCatalog(repoB, ['unit'])
+  const svc = service()
+  const agent = agentFor(repoA)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repoA, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and starts the hour')
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repoA, files: ['app.js', path.join(repoB, 'app.js')] })
+  await svc.attest(agent, { repository_root: repoB, items: [{ id: 'unit', state: 'assumed', reason: 'b-held-reason' }] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'precondition: repository B is first seen inside the hour and its facts are held, never spoken')
+  const completed = await svc.attest(agent, {
+    repository_root: repoB,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(completed.pass, true, `precondition: repository B must be complete, so it can speak only as a historical held snapshot: ${completed.problems.join(' | ')}`)
+  pastHour(svc, agent)
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repoA, files: ['app.js'] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 2, 'precondition: the held facts speak at the hour')
+  assert.ok(steerText(agent.steers[1]).includes('b-held-reason'), `precondition: the spoken advisory carried the held facts of repository B: ${steerText(agent.steers[1])}`)
+  const repoBEntry = svc.repositories.sessions.get(agent.id)?.repos.get(repoB)
+  assert.ok(repoBEntry, 'precondition: the tracker must hold repository B')
+  assert.equal(repoBEntry.introduced, false, 'a historical held snapshot must not mark the repository introduced')
+  await svc.attest(agent, { repository_root: repoB, items: [{ id: 'unit', state: 'assumed', reason: 'b-open-again' }] })
+  pastHour(svc, agent)
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repoB, files: ['app.js'] })
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 3, 'precondition: the reopened repository speaks again after the hour')
+  assert.match(steerText(agent.steers[2]), /new to this session/, `the introduction of a repository only ever shown as historical held facts must appear on its first current advisory: ${steerText(agent.steers[2])}`)
+})
+
 test('review P3: when both catalog and archive are unreadable the next step repairs both before registering', () => {
   const { catalogPath, archivePath } = reportPaths()
   const repo = reportRepo({ catalog: { path: catalogPath, state: 'unreadable', items: [], problem: 'the file is not valid JSON: boom' } })

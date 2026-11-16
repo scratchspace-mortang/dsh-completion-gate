@@ -1,6 +1,6 @@
 # dsh-completion-gate
 
-Completion Gate is a DeepSeek Harness plugin that tracks a changed file when the session's file tools also name it, resolves each tracked file to the repository that owns it, and sends the model one advisory message per user prompt naming the work still unfinished in each repository. It is a reminder, not a check: it executes no test, build, lint, recipe, or probe, and it believes what the model reports about its own work.
+Completion Gate is a DeepSeek Harness plugin that tracks a changed file when the session's file tools also name it, resolves each tracked file to the repository that owns it, and sends the model at most one advisory message per user prompt and at most one non-credential advisory per session per hour. A stop inside the hour stays silent and holds its advisory facts, which speak at the first prompt-eligible stop at or after the hour, while a credential-carrying advisory bypasses the hour and speaks at once. It is a reminder, not a check: it executes no test, build, lint, recipe, or probe, and it believes what the model reports about its own work.
 
 The plugin also keeps the Premature Stop Guard, which recovers a natural stop that clearly leaves work pending by scheduling a fresh follow-up turn.
 
@@ -133,15 +133,15 @@ Reopening is bounded by the change source. A path the host record omits cannot r
 
 ## The advisory message
 
-The gate speaks only when the model tries to end a turn, and at most once per user prompt. It takes the first attempt of the prompt that has something to say and stays silent at every later attempt.
+The gate speaks only when the model tries to end a turn, and at most once per user prompt. A non-credential advisory speaks at most once per session per hour: the first advisory speaks at once and starts the hour, and a later prompt inside the hour stays silent and holds its advisory facts, which speak at the first prompt-eligible stop at or after the hour. The one-per-prompt bound still applies first, so a prompt never sees two messages. An advisory that carries a credential hit is exempt from the hour: it speaks at once in any prompt and restarts the hour. Facts the hour held speak merged with the at-hour stop's own facts, latest wins, and a repository that completed before its held facts spoke is labelled historical, not present unfinished work.
 
 The message covers every repository the session has touched that still has unfinished work. A repository appears with its label and root, the changed files grouped by claim, the code files not yet reviewed, the reviewed files not yet demonstrated, the documentation check when it is missing, the catalog items the session stated with their state, and whether the attestation is missing, stale, or current. An item marked unrelated is left out. When unstated items exist, the message lists the stated items and then prints `Unstated catalog items: N (history; no action required unless adopted).`; at zero it omits that line. The advisory has no full catalog list; the status report carries that reading list. A repository seen for the first time in this session gets one introduction paragraph that names the repository, points at its catalog, and asks the model to register the verification it will run. The introduction appears once.
 
-The message is delivered with `agent.steer`, which queues one more model step in the same turn before the turn boundary commits. It never blocks a write or a tool call. After that one steer the gate sends no further message until another real user message arrives.
+The message is delivered with `agent.steer`, which queues one more model step in the same turn before the turn boundary commits. It never blocks a write or a tool call. After that one steer the gate sends no further message for that prompt, and non-credential advisories additionally wait for the hour, with held facts delivered at the first prompt-eligible stop at or after it.
 
 The message says it is advice and names the next action: read the catalog, register what is missing, claim or reject every file, review every changed code file the session claims, check every changed document it has not rejected, demonstrate the change in real use, then honestly attest. It never says BLOCKED and never claims a check failed.
 
-A new real user message re-arms the advisory. The gate's own steer, the premature-stop recovery, and a changed change set do not.
+A new real user message re-arms the advisory. The gate's own steer, the premature-stop recovery, and a changed change set do not. A prompt inside the hour re-arms the prompt bound but not the hour: the facts it produces are held until the hour comes due.
 
 ### When the change set cannot be determined
 

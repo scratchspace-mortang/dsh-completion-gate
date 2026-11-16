@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Hourly advisory throttle: at most one non-credential advisory per session per hour, with held-facts delivery.
+
+- A non-credential advisory speaks at most once per session per hour. The first advisory speaks at once and starts the hour; a later prompt inside the hour stays silent and holds its advisory facts (the latest throttled facts replace older ones), which speak at the first prompt-eligible stop at or after the hour. The one-per-prompt bound still applies first.
+- A credential-carrying advisory bypasses the hour and speaks at once, restarting the hour for later non-credential advisories. Credential hits seen at a prompt-silenced stop keep their existing hold-and-carry behavior.
+- A stop whose only content is an unread file or a credential hit never overwrites held advisory facts, and the unread file still rides held gaps to the next spoken advisory.
+- Held facts that speak after their repository completed are labelled historical, not present unfinished work, and held notices are marked as hold-time rather than claimed as current observations. A historical held snapshot never marks its repository introduced.
+
 ## 0.4.0
 
 Catalog items are adoption-only, and the gate tracks only paths a root-session file tool names.
