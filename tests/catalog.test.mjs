@@ -610,3 +610,36 @@ test('register refuses proves longer than the 1000 character bound and writes no
   await assert.rejects(register(svc, agentIn(repo), repo, [{ name: 'Long', proves: 'x'.repeat(1001) }]), /1000 characters/)
   assert.equal(fs.existsSync(path.join(repo, '.dsh')), false)
 })
+
+test('a failed final active write returns a refusal without throwing and writes no incoming items', async t => {
+  const repo = gitRepo()
+  seedCatalog(repo, [makeItem('fresh-item', 'Fresh item', daysAgo(1))])
+  const catalogBefore = fs.readFileSync(catalogFile(repo), 'utf8')
+  // No stale items, so the first verification.json rename is the final incoming-items write.
+  const restore = failRenameOn('verification.json', 1)
+  let result
+  try { result = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }]) }
+  finally { restore() }
+  assert.ok(result.archive.problem.includes(catalogFile(repo)), `problem names the failing catalog path: ${result.archive.problem}`)
+  assert.ok(result.archive.problem.includes('simulated rename failure'), `problem names the cause: ${result.archive.problem}`)
+  assert.deepEqual(result.archive.moved, [])
+  assert.deepEqual(result.items, [])
+  assert.equal(fs.readFileSync(catalogFile(repo), 'utf8'), catalogBefore, 'active catalog is byte-equal, no incoming item is written')
+  assert.equal(fs.existsSync(archiveFileOf(repo)), false, 'no archive file is written')
+})
+
+test('a failed final active write after a successful archive pass returns a refusal and keeps the durable archive move', async t => {
+  const repo = gitRepo()
+  const stale = makeItem('old-item', 'Old item', daysAgo(3), { command: 'npm test' })
+  seedCatalog(repo, [stale])
+  // The first verification.json rename removes the stale item (archive pass); the second is the final incoming-items write.
+  const restore = failRenameOn('verification.json', 2)
+  let result
+  try { result = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }]) }
+  finally { restore() }
+  assert.ok(result.archive.problem.includes(catalogFile(repo)), `problem names the failing catalog path: ${result.archive.problem}`)
+  assert.ok(result.archive.problem.includes('simulated rename failure'), `problem names the cause: ${result.archive.problem}`)
+  assert.deepEqual(result.items, [])
+  assert.deepEqual(readArchived(repo), [stale], 'the archive pass move stays durable')
+  assert.deepEqual(readActive(repo), [], 'the active catalog holds no incoming item after the failed final write')
+})

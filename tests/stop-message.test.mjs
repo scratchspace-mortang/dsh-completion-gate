@@ -1080,13 +1080,13 @@ function reportPaths() {
   const archivePath = path.join(CATALOG_SPAM_ROOT, '.dsh', 'verification-archive.json')
   return { catalogPath, archivePath }
 }
-function reportRepo({ catalog, items = [], unstatedCount = 0 } = {}) {
+function reportRepo({ catalog, items = [], unstatedCount = 0, problems = [] } = {}) {
   const { catalogPath } = reportPaths()
   return {
     label: 'repo', root: CATALOG_SPAM_ROOT, catalogPath,
     files: [], unclaimed: [], unreviewed: [], docsUnchecked: [], undemonstrated: [],
     catalog, items, unstatedCount, attestation: null, stale: false, introduced: true,
-    problems: [], complete: false,
+    problems, complete: false,
   }
 }
 function readableCatalog() {
@@ -1129,17 +1129,17 @@ test('ticket 1: a stated archived item keeps its line while the active catalog i
   }
   const repo = reportRepo({
     catalog,
-    items: [{ id: 'old', name: 'Archived stated name', state: 'passed' }],
+    items: [{ id: 'old', name: 'Archived stated name', state: 'passed', archived: true }],
     unstatedCount: 1,
   })
   const status = repositoriesMarkdown({ turn: 1, notices: [], repositories: [repo] })
-  assert.ok(status.includes('- old: Archived stated name | passed'), `the stated archived item keeps its status line: ${status}`)
+  assert.ok(status.includes('- old: Archived stated name | passed (archived)'), `the stated archived item keeps its status line and is marked archived: ${status}`)
   assert.ok(status.includes(catalogPath) && status.includes(archivePath), `both paths must be printed: ${status}`)
   assert.ok(status.includes('Active catalog items: 1'), `the active count must be printed: ${status}`)
   assert.ok(!status.includes('Fresh unstated name') && !status.includes('FRESH-UNSTATED-PROVES') && !status.includes('node fresh.js'), `the unstated active item text must not be printed: ${status}`)
   const advisory = advisoryMessage({ repositories: [repo] })
   assert.ok(advisory.includes(catalogPath) && advisory.includes(archivePath), `the advisory must gain both path lines: ${advisory}`)
-  assert.ok(advisory.includes('- Archived stated name (old): passed'), `the advisory keeps the stated archived item: ${advisory}`)
+  assert.ok(advisory.includes('- Archived stated name (old): passed (archived)'), `the advisory keeps the stated archived item and marks it archived: ${advisory}`)
   assert.ok(!advisory.includes('Fresh unstated name'), `the advisory must not list the unstated item: ${advisory}`)
 })
 
@@ -1217,6 +1217,151 @@ test('ticket 1: the stop advisory prints both paths, the stated item, and no uns
   assert.ok(text.includes(path.join(repo, '.dsh', 'verification-archive.json')), `the advisory must print the archive path: ${text}`)
   assert.ok(text.includes('- unit (unit): passed'), `the stated item keeps its advisory line: ${text}`)
   assert.doesNotMatch(text, /smoke/, 'the unstated item name must not appear in the advisory')
+})
+
+// Review round 1 finding 1: an unreadable archive is an unfinished obligation. The advisory must render the problem
+// (archive path and cause) with repair guidance instead of silently dropping it and sending the model to register again.
+test('review round 1: an unreadable archive is surfaced in the advisory with repair guidance', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const stamp = '2026-11-07T00:00:00.000Z'
+  const repo = reportRepo({
+    catalog: { path: catalogPath, state: 'readable', problem: null, items: [{ id: 'unit', name: 'Unit', proves: 'p', addedAt: stamp, updatedAt: stamp }] },
+    items: [{ id: 'unit', name: 'Unit', state: 'passed' }],
+    problems: [`The archive at ${archivePath} cannot be read: the file is not valid JSON: boom.`],
+  })
+  const text = advisoryMessage({ repositories: [repo] })
+  assert.ok(text.includes(archivePath), `the advisory must name the archive path: ${text}`)
+  assert.ok(text.includes('the file is not valid JSON: boom'), `the advisory must name the cause: ${text}`)
+  assert.match(text, /Repair the archive/, 'the advisory must give repair guidance')
+  assert.match(text, /do not register items until/i, 'the advisory must say not to register until the archive reads again')
+  assert.match(text, /repair the verification archive/i, 'the next step must repair the archive before registering')
+})
+
+test('review round 1: a corrupt archive file reaches the stop advisory through the evaluator problem', async () => {
+  const repo = changedRepo('advisory-corrupt-archive')
+  writeCatalog(repo, ['unit'])
+  const archivePath = path.join(repo, '.dsh', 'verification-archive.json')
+  fs.mkdirSync(path.join(repo, '.dsh'), { recursive: true })
+  fs.writeFileSync(archivePath, '{"version": 1, "items": [\n')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent)
+  announce(svc, agent, { cwd: repo, files: ['app.js'] })
+  await stop(svc, agent)
+  assert.equal(agent.steers.length, 1)
+  const text = steerText(agent.steers[0])
+  assert.ok(text.includes(archivePath), `the advisory must name the corrupt archive path: ${text}`)
+  assert.ok(text.includes('the file is not valid JSON'), `the advisory must name the cause: ${text}`)
+  assert.match(text, /Repair the archive/, 'the advisory must give repair guidance')
+})
+
+// Review round 1 finding 2: every advisory reports the active count, independently of the unstated count. An unreadable
+// catalog prints paths without a count, like the status report. The cases are all-stated, mixed, and empty.
+test('review round 1: the advisory reports the active count when every item is stated', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const stamp = '2026-11-07T00:00:00.000Z'
+  const repo = reportRepo({
+    catalog: { path: catalogPath, state: 'readable', problem: null, items: [
+      { id: 'unit', name: 'Unit', proves: 'p', addedAt: stamp, updatedAt: stamp },
+      { id: 'smoke', name: 'Smoke', proves: 'p', addedAt: stamp, updatedAt: stamp },
+    ] },
+    items: [{ id: 'unit', name: 'Unit', state: 'passed' }, { id: 'smoke', name: 'Smoke', state: 'passed' }],
+    unstatedCount: 0,
+  })
+  const text = advisoryMessage({ repositories: [repo] })
+  assert.ok(text.includes(catalogPath) && text.includes(archivePath), `both paths must be printed: ${text}`)
+  assert.ok(text.includes('Active catalog items: 2'), `the active count must be printed even when nothing is unstated: ${text}`)
+  assert.doesNotMatch(text, /Unstated catalog items:/, 'no unstated line when every item is stated')
+})
+
+test('review round 1: the advisory reports the active count alongside the unstated count', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const stamp = '2026-11-07T00:00:00.000Z'
+  const repo = reportRepo({
+    catalog: { path: catalogPath, state: 'readable', problem: null, items: [
+      { id: 'unit', name: 'Unit', proves: 'p', addedAt: stamp, updatedAt: stamp },
+      { id: 'secret-one', name: 'Unstated name', proves: 'SECRET-PROVES', command: 'node secret.js', addedAt: stamp, updatedAt: stamp },
+    ] },
+    items: [{ id: 'unit', name: 'Unit', state: 'passed' }],
+    unstatedCount: 1,
+  })
+  const text = advisoryMessage({ repositories: [repo] })
+  assert.ok(text.includes('Active catalog items: 2'), `the active count must be printed independently: ${text}`)
+  assert.ok(text.includes('Unstated catalog items: 1 (history; no action required unless adopted).'), `the unstated line is kept: ${text}`)
+  assert.doesNotMatch(text, /Unstated name|SECRET-PROVES|node secret\.js/, 'no unstated item text may reach the advisory')
+})
+
+test('review round 1: the advisory reports a zero active count for an empty readable catalog', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'readable', items: [], problem: null } })
+  const text = advisoryMessage({ repositories: [repo] })
+  assert.ok(text.includes(catalogPath) && text.includes(archivePath), `both paths must be printed for an empty catalog: ${text}`)
+  assert.ok(text.includes('Active catalog items: 0'), `an empty readable catalog counts zero active items: ${text}`)
+})
+
+test('review round 1: the advisory reports a zero active count for an absent catalog', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'absent', items: [], problem: null } })
+  const text = advisoryMessage({ repositories: [repo] })
+  assert.ok(text.includes(catalogPath) && text.includes(archivePath), `both paths must be printed for an absent catalog: ${text}`)
+  assert.ok(text.includes('Active catalog items: 0'), `an absent catalog counts zero active items: ${text}`)
+})
+
+test('review round 1: the advisory for an unreadable catalog prints paths without an active count', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'unreadable', items: [], problem: 'the file is not valid JSON: boom' } })
+  const text = advisoryMessage({ repositories: [repo] })
+  assert.ok(text.includes(catalogPath) && text.includes(archivePath), `both paths must be printed for an unreadable catalog: ${text}`)
+  assert.match(text, /Catalog unreadable/, 'the unreadable problem line is kept')
+  assert.doesNotMatch(text, /Active catalog items:/, 'an unreadable catalog prints no count, like the status report')
+})
+
+test('review round 1: the advisory reports an active count through the stop path', async () => {
+  const repo = changedRepo('advisory-active-count')
+  writeCatalog(repo, ['unit', 'smoke'])
+  fs.writeFileSync(path.join(repo, 'other.js'), 'const other = 1\n')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent)
+  announce(svc, agent, { cwd: repo, files: ['app.js', 'other.js'] })
+  await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  await stop(svc, agent)
+  assert.equal(agent.steers.length, 1)
+  const text = steerText(agent.steers[0])
+  assert.ok(text.includes('Active catalog items: 2'), `the advisory must print the active count: ${text}`)
+})
+
+// Tier-2 note from ticket 3 (model.md v1 event 7): a stated archived item is reported under its archived state. The
+// archived tag must distinguish the two states in both the status and the advisory, while the count stays active-only.
+test('review round 1: status and advisory distinguish an archived stated item from an active one', () => {
+  const { catalogPath } = reportPaths()
+  const stamp = '2026-11-07T00:00:00.000Z'
+  const repo = reportRepo({
+    catalog: { path: catalogPath, state: 'readable', problem: null, items: [
+      { id: 'fresh', name: 'Fresh name', proves: 'FRESH-PROVES', command: 'node fresh.js', addedAt: stamp, updatedAt: stamp },
+      { id: 'other', name: 'Other name', proves: 'OTHER-PROVES', command: 'node other.js', addedAt: stamp, updatedAt: stamp },
+    ] },
+    items: [
+      { id: 'fresh', name: 'Fresh name', state: 'passed', archived: false },
+      { id: 'old', name: 'Archived name', state: 'passed', archived: true },
+    ],
+    unstatedCount: 1,
+  })
+  const status = repositoriesMarkdown({ turn: 1, notices: [], repositories: [repo] })
+  const statusLines = status.split('\n')
+  assert.ok(statusLines.includes('- fresh: Fresh name | passed'), `the active stated item has no archived tag in status: ${status}`)
+  assert.ok(statusLines.includes('- old: Archived name | passed (archived)'), `the archived stated item is marked archived in status: ${status}`)
+  assert.ok(status.includes('Active catalog items: 2'), `the count stays active-only: ${status}`)
+  const advisory = advisoryMessage({ repositories: [repo] })
+  const advisoryLines = advisory.split('\n')
+  assert.ok(advisoryLines.includes('- Fresh name (fresh): passed'), `the active stated item has no archived tag in the advisory: ${advisory}`)
+  assert.ok(advisoryLines.includes('- Archived name (old): passed (archived)'), `the archived stated item is marked archived in the advisory: ${advisory}`)
+  assert.ok(advisory.includes('Active catalog items: 2'), `the advisory count stays active-only: ${advisory}`)
 })
 
 // The turn's changed lines are readable even when the repository report throws, so a credential in them is named now
