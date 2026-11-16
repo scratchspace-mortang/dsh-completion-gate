@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CompletionGateService } from '../lib/index.js'
+import { archivePathOf, isStale, readArchive, registerItems } from '../lib/catalog.js'
 
 // Test workspaces live under the task's Trash root, never the system temporary directory (AGENTS.md). The tests never
 // delete them, so each run leaves its workspaces in that Trash root for the user to clear.
@@ -298,6 +299,303 @@ test('an unreadable catalog quotes its text on one line in the status report', a
   assert.ok(markdown.includes('### Forged'), 'the parse problem quotes the file text, so the check below is not vacuous')
   assert.equal(lines.some(line => line.startsWith('### Forged')), false, 'the quoted file text starts no heading of its own')
   assert.equal(lines.filter(line => line.startsWith('Catalog unreadable')).length, 1, 'the problem is one line')
+})
+
+const DAY_MS = 24 * 60 * 60 * 1000
+const catalogFile = repo => path.join(repo, '.dsh', 'verification.json')
+const archiveFileOf = repo => archivePathOf(repo)
+
+function daysAgo(days, extraMs = 0) { return new Date(Date.now() - days * DAY_MS - extraMs).toISOString() }
+function makeItem(id, name, updatedAt, extra = {}) {
+  return { id, name, proves: `Proves ${name}.`, addedAt: daysAgo(10), updatedAt, ...extra }
+}
+function seedFile(file, items) {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, `${JSON.stringify({ version: 1, items }, null, 2)}\n`)
+}
+function seedCatalog(repo, items) { seedFile(catalogFile(repo), items) }
+function seedArchive(repo, items) { seedFile(archiveFileOf(repo), items) }
+function readActive(repo) { return JSON.parse(fs.readFileSync(catalogFile(repo), 'utf8')).items }
+function readArchived(repo) { return readArchive(repo).items }
+// Makes the Nth rename onto a file with this name throw, simulating a failed atomic write. Returns a restore function.
+function failRenameOn(fileName, onCall = 1) {
+  const original = fs.renameSync
+  let count = 0
+  fs.renameSync = (src, dest) => {
+    if (String(dest).endsWith(fileName)) {
+      count += 1
+      if (count === onCall) throw new Error('simulated rename failure')
+    }
+    return original(src, dest)
+  }
+  return () => { fs.renameSync = original }
+}
+
+test('isStale: exactly 2 days is not stale, beyond is, unparseable never is', () => {
+  const now = Date.now()
+  assert.equal(isStale({ updatedAt: new Date(now - 2 * DAY_MS).toISOString() }, now), false, 'exactly 2 days is not stale')
+  assert.equal(isStale({ updatedAt: new Date(now - 2 * DAY_MS - 1).toISOString() }, now), true, '1ms beyond 2 days is stale')
+  assert.equal(isStale({ updatedAt: new Date(now - 2 * DAY_MS + 1000).toISOString() }, now), false, 'within 2 days is not stale')
+  assert.equal(isStale({ updatedAt: 'not-a-date' }, now), false, 'unparseable is never stale')
+  assert.equal(isStale({}, now), false, 'missing updatedAt is never stale')
+})
+
+test('register archives a stale item with the full item preserved and leaves it out of the active catalog', async t => {
+  const repo = gitRepo()
+  const stale = makeItem('old-item', 'Old item', daysAgo(3), { command: 'npm test', proves: 'It proved the old thing.' })
+  const fresh = makeItem('fresh-item', 'Fresh item', daysAgo(1))
+  seedCatalog(repo, [stale, fresh])
+  const result = await registerItems(repo, [{ name: 'Brand new', proves: 'It is new.' }])
+  assert.equal(result.archive.path, archiveFileOf(repo))
+  assert.deepEqual(result.archive.moved, ['old-item'])
+  assert.equal(result.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [stale], 'the archived item is the full original item')
+  const active = readActive(repo)
+  assert.deepEqual(active.map(item => item.id).sort(), ['brand-new', 'fresh-item'])
+  assert.deepEqual(result.items, [{ id: 'brand-new', name: 'Brand new', created: true }])
+})
+
+test('register keeps items within 2 days and with unparseable updatedAt in the active catalog', async t => {
+  const repo = gitRepo()
+  const within = makeItem('within-item', 'Within item', daysAgo(2, -60 * 1000))
+  const unparseable = makeItem('weird-item', 'Weird item', 'not-a-date')
+  seedCatalog(repo, [within, unparseable])
+  const result = await registerItems(repo, [{ name: 'Fresh name', proves: 'Fresh.' }])
+  assert.deepEqual(result.archive.moved, [])
+  assert.equal(fs.existsSync(archiveFileOf(repo)), false, 'no archive file is written')
+  assert.deepEqual(readActive(repo).map(item => item.id).sort(), ['fresh-name', 'weird-item', 'within-item'])
+})
+
+test('register with only fresh items writes no archive file', async t => {
+  const repo = gitRepo()
+  const result = await registerItems(repo, [{ name: 'Only fresh', proves: 'Fresh.' }])
+  assert.equal(result.archive.problem, null)
+  assert.deepEqual(result.archive.moved, [])
+  assert.equal(fs.existsSync(archiveFileOf(repo)), false)
+})
+
+test('a second pass at the same time writes nothing to the archive', async t => {
+  const repo = gitRepo()
+  seedCatalog(repo, [makeItem('old-item', 'Old item', daysAgo(3))])
+  await registerItems(repo, [{ name: 'First fresh', proves: 'First.' }])
+  const bytes = fs.readFileSync(archiveFileOf(repo), 'utf8')
+  const mtime = fs.statSync(archiveFileOf(repo)).mtimeMs
+  await sleep(20)
+  const second = await registerItems(repo, [{ name: 'Second fresh', proves: 'Second.' }])
+  assert.deepEqual(second.archive.moved, [])
+  assert.equal(fs.readFileSync(archiveFileOf(repo), 'utf8'), bytes, 'archive bytes are unchanged')
+  assert.equal(fs.statSync(archiveFileOf(repo)).mtimeMs, mtime, 'archive file is not rewritten')
+})
+
+test('an unreadable archive returns a problem without throwing and writes nothing', async t => {
+  const repo = gitRepo()
+  seedCatalog(repo, [makeItem('fresh-item', 'Fresh item', daysAgo(1))])
+  fs.mkdirSync(path.join(repo, '.dsh'), { recursive: true })
+  const corrupt = '{"version": 1, "items": [\n'
+  fs.writeFileSync(archiveFileOf(repo), corrupt)
+  const catalogBefore = fs.readFileSync(catalogFile(repo), 'utf8')
+  const result = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }])
+  assert.ok(result.archive.problem.includes(archiveFileOf(repo)), `problem names the archive path: ${result.archive.problem}`)
+  assert.deepEqual(result.archive.moved, [])
+  assert.deepEqual(result.items, [])
+  assert.equal(fs.readFileSync(catalogFile(repo), 'utf8'), catalogBefore, 'active catalog is byte-equal')
+  assert.equal(fs.readFileSync(archiveFileOf(repo), 'utf8'), corrupt, 'archive file is byte-equal')
+  assert.equal(readActive(repo).some(item => item.name === 'Incoming'), false, 'no incoming item is written')
+})
+
+test('an archive write failure returns a problem, preserves the active catalog, and writes no incoming items', async t => {
+  const repo = gitRepo()
+  seedCatalog(repo, [makeItem('old-item', 'Old item', daysAgo(3))])
+  const catalogBefore = fs.readFileSync(catalogFile(repo), 'utf8')
+  const restore = failRenameOn('verification-archive.json')
+  let result
+  try { result = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }]) }
+  finally { restore() }
+  assert.ok(result.archive.problem.includes(archiveFileOf(repo)), `problem names the archive path: ${result.archive.problem}`)
+  assert.deepEqual(result.archive.moved, [])
+  assert.deepEqual(result.items, [])
+  assert.equal(fs.readFileSync(catalogFile(repo), 'utf8'), catalogBefore, 'active catalog is preserved')
+  assert.equal(fs.existsSync(archiveFileOf(repo)), false, 'no archive file is left behind')
+})
+
+test('a failed active write after the archive write leaves a duplicate that the retry reconciles', async t => {
+  const repo = gitRepo()
+  const stale = makeItem('old-item', 'Old item', daysAgo(3), { command: 'npm test' })
+  seedCatalog(repo, [stale])
+  const restore = failRenameOn('verification.json')
+  let failed
+  try { failed = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }]) }
+  finally { restore() }
+  assert.ok(failed.archive.problem.includes(catalogFile(repo)), `problem names the failing path: ${failed.archive.problem}`)
+  assert.deepEqual(failed.archive.moved, [])
+  assert.deepEqual(readArchived(repo), [stale], 'the archive write is durable')
+  assert.deepEqual(readActive(repo), [stale], 'the active copy is still there: a duplicate')
+  assert.equal(readActive(repo).some(item => item.name === 'Incoming'), false, 'no incoming item is written')
+
+  const retried = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }])
+  assert.equal(retried.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [stale], 'the archive keeps the full item')
+  assert.deepEqual(readActive(repo).map(item => item.name), ['Incoming'], 'the retry removes the duplicate active copy and writes the incoming item')
+})
+
+test('a crafted duplicate (archive written, active not) is reconciled by the next pass', async t => {
+  const repo = gitRepo()
+  const item = makeItem('dup-item', 'Dup item', daysAgo(3), { command: 'npm test' })
+  seedCatalog(repo, [item])
+  seedArchive(repo, [item])
+  const result = await registerItems(repo, [{ name: 'Next fresh', proves: 'Next.' }])
+  assert.equal(result.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [item])
+  assert.deepEqual(readActive(repo).map(item => item.name), ['Next fresh'])
+})
+
+test('an equal-timestamp different-content duplicate is refused with both files byte-equal', async t => {
+  const repo = gitRepo()
+  const stamp = daysAgo(3)
+  seedCatalog(repo, [makeItem('dup-item', 'Dup item', stamp, { proves: 'Active version.' })])
+  seedArchive(repo, [makeItem('dup-item', 'Dup item', stamp, { proves: 'Archived version.' })])
+  const catalogBefore = fs.readFileSync(catalogFile(repo), 'utf8')
+  const archiveBefore = fs.readFileSync(archiveFileOf(repo), 'utf8')
+  const result = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }])
+  assert.ok(result.archive.problem.includes(archiveFileOf(repo)), `problem names the archive path: ${result.archive.problem}`)
+  assert.deepEqual(result.archive.moved, [])
+  assert.deepEqual(result.items, [])
+  assert.equal(fs.readFileSync(catalogFile(repo), 'utf8'), catalogBefore, 'active catalog is byte-equal')
+  assert.equal(fs.readFileSync(archiveFileOf(repo), 'utf8'), archiveBefore, 'archive file is byte-equal')
+})
+
+test('a duplicate with an unparseable updatedAt on either copy is refused with both files byte-equal', async t => {
+  const repo = gitRepo()
+  seedCatalog(repo, [makeItem('dup-item', 'Dup item', 'not-a-date')])
+  seedArchive(repo, [makeItem('dup-item', 'Dup item', daysAgo(3))])
+  const catalogBefore = fs.readFileSync(catalogFile(repo), 'utf8')
+  const archiveBefore = fs.readFileSync(archiveFileOf(repo), 'utf8')
+  const result = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }])
+  assert.ok(result.archive.problem, 'a problem is returned')
+  assert.equal(fs.readFileSync(catalogFile(repo), 'utf8'), catalogBefore, 'active catalog is byte-equal')
+  assert.equal(fs.readFileSync(archiveFileOf(repo), 'utf8'), archiveBefore, 'archive file is byte-equal')
+})
+
+test('a newer active duplicate prunes the older archive copy', async t => {
+  const repo = gitRepo()
+  const activeCopy = makeItem('dup-item', 'Dup item', daysAgo(2, 1000), { proves: 'Newer active version.' })
+  const archiveCopy = makeItem('dup-item', 'Dup item', daysAgo(4), { proves: 'Older archived version.' })
+  seedCatalog(repo, [activeCopy])
+  seedArchive(repo, [archiveCopy])
+  // The active copy is newer, so it is kept; it is also stale, so the same pass then archives it.
+  const result = await registerItems(repo, [{ name: 'Next fresh', proves: 'Next.' }])
+  assert.equal(result.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [activeCopy], 'the newer active copy wins and is archived by the pass')
+  assert.deepEqual(readActive(repo).map(item => item.name), ['Next fresh'])
+})
+
+test('a newer active duplicate that is fresh prunes the archive without archiving the keeper', async t => {
+  const repo = gitRepo()
+  const activeCopy = makeItem('dup-item', 'Dup item', daysAgo(1), { proves: 'Newer active version.' })
+  const archiveCopy = makeItem('dup-item', 'Dup item', daysAgo(4), { proves: 'Older archived version.' })
+  seedCatalog(repo, [activeCopy])
+  seedArchive(repo, [archiveCopy])
+  const result = await registerItems(repo, [{ name: 'Next fresh', proves: 'Next.' }])
+  assert.equal(result.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [], 'the older archive copy is pruned')
+  assert.deepEqual(readActive(repo).map(item => item.id).sort(), ['dup-item', 'next-fresh'])
+  assert.equal(readActive(repo).find(item => item.id === 'dup-item').proves, 'Newer active version.')
+})
+
+test('a newer archive duplicate drops the older active copy', async t => {
+  const repo = gitRepo()
+  const activeCopy = makeItem('dup-item', 'Dup item', daysAgo(4), { proves: 'Older active version.' })
+  const archiveCopy = makeItem('dup-item', 'Dup item', daysAgo(3), { proves: 'Newer archived version.' })
+  seedCatalog(repo, [activeCopy])
+  seedArchive(repo, [archiveCopy])
+  const result = await registerItems(repo, [{ name: 'Next fresh', proves: 'Next.' }])
+  assert.equal(result.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [archiveCopy], 'the newer archived copy is kept')
+  assert.deepEqual(readActive(repo).map(item => item.name), ['Next fresh'])
+})
+
+test('a second failure during reconciliation preserves both copies with no loss', async t => {
+  const repo = gitRepo()
+  const item = makeItem('dup-item', 'Dup item', daysAgo(3))
+  seedCatalog(repo, [item])
+  seedArchive(repo, [item])
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const restore = failRenameOn('verification.json')
+    let result
+    try { result = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }]) }
+    finally { restore() }
+    assert.ok(result.archive.problem, `attempt ${attempt + 1} returns a problem`)
+    assert.deepEqual(readActive(repo), [item], `attempt ${attempt + 1} keeps the active copy`)
+    assert.deepEqual(readArchived(repo), [item], `attempt ${attempt + 1} keeps the archived copy`)
+    assert.equal(readActive(repo).some(entry => entry.name === 'Incoming'), false, 'no incoming item is written')
+  }
+  const retried = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }])
+  assert.equal(retried.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [item])
+  assert.deepEqual(readActive(repo).map(item => item.name), ['Incoming'])
+})
+
+test('ids are reserved across both files for slug collisions', async t => {
+  const repo = gitRepo()
+  const archived = makeItem('unit-tests', 'Unit tests', daysAgo(3))
+  seedCatalog(repo, [])
+  seedArchive(repo, [archived])
+  const result = await registerItems(repo, [{ name: 'unit-tests', proves: 'A different name, the same slug.' }])
+  assert.deepEqual(result.items, [{ id: 'unit-tests-2', name: 'unit-tests', created: true }])
+  assert.deepEqual(readArchived(repo), [archived], 'the archived item keeps its id')
+  assert.deepEqual(readActive(repo).map(item => item.id), ['unit-tests-2'])
+})
+
+test('re-registering an archived name creates a new active item with a fresh id', async t => {
+  const repo = gitRepo()
+  const archived = makeItem('old-item', 'Old item', daysAgo(3), { proves: 'Archived version.' })
+  seedCatalog(repo, [])
+  seedArchive(repo, [archived])
+  const result = await registerItems(repo, [{ name: 'Old item', proves: 'New active version.' }])
+  assert.deepEqual(result.items, [{ id: 'old-item-2', name: 'Old item', created: true }])
+  assert.deepEqual(readArchived(repo), [archived], 'the archived item is untouched')
+  const active = readActive(repo)
+  assert.equal(active.length, 1)
+  assert.equal(active[0].id, 'old-item-2')
+  assert.equal(active[0].proves, 'New active version.')
+})
+
+test('a stale active name is archived by the pass and re-enters as a new active item with a fresh id', async t => {
+  const repo = gitRepo()
+  const stale = makeItem('stale-item', 'Stale item', daysAgo(3), { proves: 'Stale version.' })
+  seedCatalog(repo, [stale])
+  const result = await registerItems(repo, [{ name: 'Stale item', proves: 'Fresh re-registration.' }])
+  assert.deepEqual(result.archive.moved, ['stale-item'])
+  assert.deepEqual(readArchived(repo), [stale], 'the archived copy keeps the old item in full')
+  const active = readActive(repo)
+  assert.equal(active.length, 1)
+  assert.equal(active[0].id, 'stale-item-2', 'the re-registration gets a fresh id')
+  assert.equal(active[0].proves, 'Fresh re-registration.')
+  assert.equal(active[0].addedAt, active[0].updatedAt, 'the new item starts fresh')
+  assert.deepEqual(result.items, [{ id: 'stale-item-2', name: 'Stale item', created: true }])
+})
+
+test('failure and retry with one reconcilable duplicate plus one stale item keeps the reconciled state', async t => {
+  const repo = gitRepo()
+  const dupActive = makeItem('dup-item', 'Dup item', daysAgo(3), { proves: 'Newer active copy.' })
+  const dupArchive = makeItem('dup-item', 'Dup item', daysAgo(4), { proves: 'Older archived copy.' })
+  const stale = makeItem('stale-item', 'Stale item', daysAgo(3))
+  seedCatalog(repo, [dupActive, stale])
+  seedArchive(repo, [dupArchive])
+  // The first archive write (pruning the older duplicate copy) succeeds; the second (archiving the stale items) fails.
+  const restore = failRenameOn('verification-archive.json', 2)
+  let failed
+  try { failed = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }]) }
+  finally { restore() }
+  assert.ok(failed.archive.problem.includes(archiveFileOf(repo)), `problem names the archive path: ${failed.archive.problem}`)
+  assert.deepEqual(readArchived(repo), [], 'the reconciliation is durable: the older archive copy is gone')
+  assert.deepEqual(readActive(repo).map(item => item.id).sort(), ['dup-item', 'stale-item'], 'both items survive active')
+  assert.equal(readActive(repo).some(item => item.name === 'Incoming'), false, 'no incoming item is written')
+
+  const retried = await registerItems(repo, [{ name: 'Incoming', proves: 'Incoming.' }])
+  assert.equal(retried.archive.problem, null)
+  assert.deepEqual(readArchived(repo), [dupActive, stale], 'the retry archives both stale items in full')
+  assert.deepEqual(readActive(repo).map(item => item.name), ['Incoming'])
 })
 
 test('register refuses proves longer than the 1000 character bound and writes nothing', async t => {
