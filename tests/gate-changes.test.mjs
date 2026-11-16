@@ -70,6 +70,11 @@ function agentFor(cwd, id = 'session-1') {
   return { id, session: { header: { cwd }, events: [] }, steer: m => steers.push(m), followup: m => followups.push(m), steers, followups }
 }
 
+// Ticket personal#0k21 (hourly throttle): the gate speaks at most one non-credential
+// advisory per session per hour, so a test that expects a second prompt to speak ages
+// the last-advisory time past the hour, as tests/stop-message.test.mjs does.
+function pastHour(svc, agent) { svc.state(agent).lastAdvisoryAt = Date.now() - (60 * 60 * 1000 + 1000) }
+
 // The host appends the batch of queued messages to its `turn/start`, the real user prompt included, before the first
 // step. The gate reads that prompt on the `session/event` hook, so one message is delivered here for every turn
 // opened, and a stop never runs in a state the host cannot produce.
@@ -346,6 +351,7 @@ test('a turn keeps its attestation across repeated stops while its files and con
     await svc.stopping({ agent, turn: 3 })
     assert.equal(agent.steers.length, 1, 'a changed file inside the prompt must not speak again; the reopen waits for the next real user message')
     // The next real user prompt starts turn 4, which re-arms the one message and names the reopened repository.
+    pastHour(svc, agent)
     announce(svc, 'session-1', 4, 311, [file('app.js')], repo)
     await svc.stopping({ agent, turn: 4 })
     assert.equal(agent.steers.length, 2, 'the next real prompt sends one message about the reopened repository')

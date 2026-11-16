@@ -130,6 +130,13 @@ function prompt(svc, agent, turn = TURN) {
 
 function steerText(steer) { return steer.content.map(part => part.text).join('') }
 
+// Ticket personal#0k21 (hourly throttle): the gate tracks the last spoken advisory time
+// per session. A test ages that time directly, so a later prompt can be at/after the
+// hour without waiting in real time.
+const HOUR_MS = 60 * 60 * 1000
+function ageLastAdvisory(svc, agent, msAgo) { svc.state(agent).lastAdvisoryAt = Date.now() - msAgo }
+function pastHour(svc, agent) { ageLastAdvisory(svc, agent, HOUR_MS + 1000) }
+
 // The advisory shape every message keeps: it says nothing is stopped and never uses blocking wording.
 function assertAdvisory(text) {
   assert.match(text, /nothing is stopped/i, 'the message must say nothing is stopped')
@@ -195,6 +202,7 @@ test('the introduction appears in the first message for a repository and never a
   assert.equal(agent.steers.length, 1, 'the first prompt sends the first message')
   await stop(svc, agent)
   assert.equal(agent.steers.length, 1, 'a later stop of the same prompt is silent')
+  pastHour(svc, agent)
   begin(svc, agent, 4)
   prompt(svc, agent, 4)
   announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
@@ -419,6 +427,7 @@ test('one prompt speaks once, a changed change set waits, and the next prompt sp
   announce(svc, agent, { cwd: repo, files: ['app.js'] })
   await stop(svc, agent)
   assert.equal(agent.steers.length, 1, 'a changed file inside the prompt must not speak again')
+  pastHour(svc, agent)
   begin(svc, agent, 4)
   prompt(svc, agent, 4)
   announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
@@ -784,6 +793,7 @@ test('a new real user message re-arms exactly one message', async () => {
   announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
   for (let i = 0; i < 3; i += 1) await stop(svc, agent, 3)
   const before = agent.steers.length
+  pastHour(svc, agent)
   begin(svc, agent, 4)
   prompt(svc, agent, 4)
   announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
@@ -841,6 +851,7 @@ test('a premature-stop recovery turn does not re-arm the advisory, even with the
   assert.equal(agent.steers.length, 1, 'a later stop of the recovery turn must stay silent')
   assert.equal(agent.followups.length, 1, 'the recovery turn must not queue a second followup')
   // A real user message is what re-arms, so the next prompt speaks once more.
+  pastHour(svc, agent)
   begin(svc, agent, 5)
   prompt(svc, agent, 5)
   announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'] })
@@ -862,6 +873,7 @@ test('a notice recorded after the prompt message waits for the next real prompt'
   announce(svc, agent, { turn: 3, cwd: a, files: ['app.js', path.join(b, 'app.js')] })
   await stop(svc, agent, 3)
   assert.equal(agent.steers.length, 1, 'a repository seen after the message must wait for the next prompt')
+  pastHour(svc, agent)
   begin(svc, agent, 4)
   prompt(svc, agent, 4)
   announce(svc, agent, { turn: 4, cwd: a, files: ['app.js', path.join(b, 'app.js')] })
@@ -921,6 +933,7 @@ test('a credential hit suppressed by the bound is carried into the next prompt e
   assert.match(text, /Possible hard-coded credential or secret/, 'the carried hit must be named even when the new diff is clean')
   assert.doesNotMatch(text, /hunter2/, 'the matched value must never be written into the message')
   // The carried hit is spent: a later prompt must not repeat a credential the session already saw.
+  pastHour(svc, agent)
   begin(svc, agent, 5)
   prompt(svc, agent, 5)
   announce(svc, agent, { turn: 5, cwd: repo, files: ['other.js'], diffs: [[]] })
@@ -940,6 +953,7 @@ test('verificationNudgeLimit is not consulted', async () => {
   await stop(svc, agent, 3)
   await stop(svc, agent, 3)
   assert.equal(agent.steers.length, 1, 'a zero verificationNudgeLimit must not silence the advisory')
+  pastHour(svc, agent)
   begin(svc, agent, 4)
   prompt(svc, agent, 4)
   announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
@@ -1005,6 +1019,7 @@ test('a second real user message in the same turn re-arms the bound', async () =
   announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
   await stop(svc, agent, 3)
   assert.equal(agent.steers.length, 1, 'precondition: the first prompt speaks')
+  pastHour(svc, agent)
   svc.publish(agent, 'user/message', userMessage(agent.id, 3))
   announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
   await stop(svc, agent, 3)
@@ -1062,6 +1077,7 @@ test('a silent stop carries an unread-file notice the next prompt cannot read ag
   await stop(svc, agent, 3)
   assert.equal(agent.steers.length, 1, 'a stop over an attested, unchanged set must stay silent')
   failing = false
+  pastHour(svc, agent)
   begin(svc, agent, 4)
   announce(svc, agent, { turn: 4, cwd: repo, files: ['other.js'] })
   await stop(svc, agent, 4)
@@ -1489,6 +1505,140 @@ test('review P3: a new session with only an unreadable archive repairs the archi
 
 // Review finding P3 (catalog-spam): when both catalog and archive are unreadable, the next step must name BOTH repairs
 // before any registration, because registering still refuses until the archive is repaired too.
+// Ticket personal#0k21 (hourly throttle core, Q1/Q2/Q4): the first advisory in a
+// session speaks at once and starts the hour; a second non-credential stop inside
+// the hour stays silent and is held.
+test('hourly throttle: the first advisory speaks at once and a second stop within the hour stays silent', async () => {
+  const repo = changedRepo('hourly-first')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'the first advisory in a session must speak at once')
+  assert.ok(steerText(agent.steers[0]).includes(`Root: ${repo}`), 'the first advisory must name the repository')
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'two non-credential stops within an hour must produce exactly one spoken advisory')
+})
+
+// Ticket personal#0k21 (hourly throttle core, S3): a stop just before the hour
+// stays silent; the held advisory speaks at the first prompt-eligible stop at/after
+// the hour.
+test('hourly throttle: a stop just before the hour stays silent and the held advisory speaks at the hour', async () => {
+  const repo = changedRepo('hourly-boundary')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and starts the hour')
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'a stop inside the hour must stay silent')
+  ageLastAdvisory(svc, agent, 59 * 60 * 1000)
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 1, 'a stop just before the hour must stay silent')
+  ageLastAdvisory(svc, agent, HOUR_MS)
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 2, 'the held advisory must speak at the first prompt-eligible stop at/after the hour')
+  assert.ok(steerText(agent.steers[1]).includes(`Root: ${repo}`), 'the spoken held advisory must name the repository')
+})
+
+// Ticket personal#0k21 (hourly throttle core, S5 latest-wins): distinct held
+// advisories A then B deliver B, never A, at a prompt-eligible stop at/after
+// the hour, when that stop carries its own advisory.
+test('hourly throttle: held advisories A then B deliver B, never A, when the at-hour stop carries its own advisory', async () => {
+  const repo = changedRepo('hourly-latest-own')
+  writeCatalog(repo, ['unit'])
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and starts the hour')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'alpha-held-reason' }] })
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'held advisory A must stay silent inside the hour')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'beta-held-reason' }] })
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 1, 'held advisory B must stay silent inside the hour')
+  pastHour(svc, agent)
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 2, 'the at-hour stop must speak the held advisory')
+  const text = steerText(agent.steers[1])
+  assert.ok(text.includes('beta-held-reason'), `the spoken advisory must carry the latest held facts (B): ${text}`)
+  assert.doesNotMatch(text, /alpha-held-reason/, `the spoken advisory must never carry the older held facts (A): ${text}`)
+})
+
+// Ticket personal#0k21 (hourly throttle core, S5 latest-wins): distinct held
+// advisories A then B deliver B, never A, at a prompt-eligible stop at/after
+// the hour, when that stop carries no advisory of its own.
+test('hourly throttle: held advisories A then B deliver B, never A, when the at-hour stop carries no advisory', async () => {
+  const repo = changedRepo('hourly-latest-none')
+  writeCatalog(repo, ['unit'])
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and starts the hour')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'alpha-held-reason' }] })
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 1, 'held advisory A must stay silent inside the hour')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'beta-held-reason' }] })
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 1, 'held advisory B must stay silent inside the hour')
+  // The at-hour stop carries no advisory of its own: the repository is completed
+  // before it, so only the held facts can speak.
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'] })
+  const completed = await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(completed.pass, true, `precondition: the repository must be complete, so the at-hour stop has no advisory of its own: ${completed.problems.join(' | ')}`)
+  pastHour(svc, agent)
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 2, 'the held advisory must speak even when the at-hour stop carries no advisory')
+  const text = steerText(agent.steers[1])
+  assert.ok(text.includes('beta-held-reason'), `the spoken advisory must carry the latest held facts (B): ${text}`)
+  assert.doesNotMatch(text, /alpha-held-reason/, `the spoken advisory must never carry the older held facts (A): ${text}`)
+  assert.ok(text.includes(`Root: ${repo}`), 'the spoken held advisory must name the repository')
+})
+
 test('review P3: when both catalog and archive are unreadable the next step repairs both before registering', () => {
   const { catalogPath, archivePath } = reportPaths()
   const repo = reportRepo({ catalog: { path: catalogPath, state: 'unreadable', items: [], problem: 'the file is not valid JSON: boom' } })
