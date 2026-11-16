@@ -1585,11 +1585,26 @@ test('hourly throttle: held advisories A then B deliver B, never A, when the at-
   pastHour(svc, agent)
   begin(svc, agent, 6)
   prompt(svc, agent, 6)
-  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'] })
+  const other = changedRepo('hourly-latest-own-current')
+  writeCatalog(other, ['current'])
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js', path.join(other, 'app.js')] })
+  // The held repository is completed before the at-hour stop, so its held B
+  // fact is present only in the held snapshot. The at-hour stop carries its
+  // own distinct fact on the other repository, so dropping the held facts
+  // would lose B while the own-advisory assertion alone would still pass.
+  const completed = await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(completed.pass, true, `precondition: the held repository must be complete, so B is held-only: ${completed.problems.join(' | ')}`)
+  await svc.attest(agent, { repository_root: other, items: [{ id: 'current', state: 'assumed', reason: 'gamma-current-reason' }] })
   await stop(svc, agent, 6)
   assert.equal(agent.steers.length, 2, 'the at-hour stop must speak the held advisory')
   const text = steerText(agent.steers[1])
   assert.ok(text.includes('beta-held-reason'), `the spoken advisory must carry the latest held facts (B): ${text}`)
+  assert.ok(text.includes('gamma-current-reason'), `the spoken advisory must carry the at-hour stop's own distinct fact: ${text}`)
   assert.doesNotMatch(text, /alpha-held-reason/, `the spoken advisory must never carry the older held facts (A): ${text}`)
 })
 
@@ -1637,6 +1652,43 @@ test('hourly throttle: held advisories A then B deliver B, never A, when the at-
   assert.ok(text.includes('beta-held-reason'), `the spoken advisory must carry the latest held facts (B): ${text}`)
   assert.doesNotMatch(text, /alpha-held-reason/, `the spoken advisory must never carry the older held facts (A): ${text}`)
   assert.ok(text.includes(`Root: ${repo}`), 'the spoken held advisory must name the repository')
+  assert.match(text, /historical/i, `the held snapshot of a repository completed before delivery must be labelled historical, not present unfinished work: ${text}`)
+  assert.doesNotMatch(text, /Attestation: missing\./, `an obsolete missing attestation must not be represented as a current obligation: ${text}`)
+  assert.doesNotMatch(text, /Next: register/, `an obsolete call to action must not be represented as a current obligation: ${text}`)
+})
+
+// A transient warning seen at a same-prompt stop silenced by the prompt bound
+// is held, so it still speaks at the first prompt-eligible stop at/after the
+// hour even when the warning has cleared by then. The prompt bound itself
+// speaks at most once per prompt.
+test('prompt bound: a transient warning at a same-prompt stop is held and speaks at the hour after it clears', async () => {
+  const repo = changedRepo('prompt-bound-held')
+  writeCatalog(repo, ['unit'])
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and arms the prompt bound')
+  await svc.attest(agent, { repository_root: repo, items: [{ id: 'unit', state: 'assumed', reason: 'transient-warning-reason' }] })
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'the same-prompt stop must stay silent and hold the transient warning')
+  const completed = await svc.attest(agent, {
+    repository_root: repo,
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed' }],
+  })
+  assert.equal(completed.pass, true, `precondition: the warning must clear before the at-hour stop: ${completed.problems.join(' | ')}`)
+  pastHour(svc, agent)
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 2, 'the held transient warning must speak at the first prompt-eligible stop at/after the hour')
+  assert.ok(steerText(agent.steers[1]).includes('transient-warning-reason'), `the spoken advisory must carry the held transient warning: ${steerText(agent.steers[1])}`)
 })
 
 // Ticket personal#tr7n (credential bypass, Q3, invariant S2): a stop carrying a
