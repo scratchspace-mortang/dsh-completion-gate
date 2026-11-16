@@ -1639,6 +1639,102 @@ test('hourly throttle: held advisories A then B deliver B, never A, when the at-
   assert.ok(text.includes(`Root: ${repo}`), 'the spoken held advisory must name the repository')
 })
 
+// Ticket personal#tr7n (credential bypass, Q3, invariant S2): a stop carrying a
+// credential hit in a new prompt speaks at once inside the hour, bypassing the
+// hourly limit from ticket personal#0k21.
+test('credential bypass: a credential stop inside the hour in a new prompt speaks immediately (Q3)', async () => {
+  const repo = changedRepo('credential-bypass-within-hour')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first non-credential advisory speaks and starts the hour')
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'], diffs: [['+password = "hunter2hunter2"']] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 2, 'a credential stop inside the hour in a new prompt must speak immediately, bypassing the hourly limit')
+  const text = steerText(agent.steers[1])
+  assert.match(text, /Possible hard-coded credential or secret/, 'the bypassed advisory must name the credential rule')
+  assert.doesNotMatch(text, /hunter2/, 'the matched value must never be written into the message')
+})
+
+// Ticket personal#tr7n (credential bypass, Q3, invariant S2): a credential hit
+// seen at a stop the prompt bound silences is held in heldCredentials and
+// speaks at the next prompt-eligible stop, which is also a credential speak
+// that bypasses the hour, with no loss even when that stop's own diff is clean.
+test('credential bypass: a credential hit at a prompt-silenced stop is held and speaks at the next prompt-eligible stop with no loss (Q3, S2)', async () => {
+  const repo = changedRepo('credential-bypass-held')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first stop sends the prompt advisory and starts the hour')
+  assert.doesNotMatch(steerText(agent.steers[0]), /Possible hard-coded credential/, 'precondition: the first message has no hit to name')
+  // The same prompt stops again and now exposes the credential. The prompt
+  // bound silences this stop, so the hit is retained, not spoken and not lost.
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'], diffs: [['+password = "hunter2hunter2"']] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'a credential hit at a prompt-silenced stop must stay silent at that stop')
+  // The next prompt is inside the hour and its own diff is clean, so only the
+  // held hit can name the credential, and held credentials bypass the hour.
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 2, 'the held credential must speak at the next prompt-eligible stop without waiting for the hour')
+  const text = steerText(agent.steers[1])
+  assert.match(text, /Possible hard-coded credential or secret/, 'the held credential must be named at the next prompt-eligible stop, with no loss')
+  assert.doesNotMatch(text, /hunter2/, 'the matched value must never be written into the message')
+})
+
+// Ticket personal#tr7n (credential bypass, Q3): a credential speak restarts
+// the hour for later non-credential advisories. The held non-credential
+// advisory then speaks at the first prompt-eligible stop at/after that new
+// hour. Elapsed time is simulated by shifting the recorded speak time, so the
+// shift is relative to whatever the credential speak actually recorded.
+test('credential bypass: a credential speak restarts the hour, so a later non-credential stop is held (Q3)', async () => {
+  const repo = changedRepo('credential-bypass-restarts-hour')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent, 3)
+  prompt(svc, agent, 3)
+  announce(svc, agent, { turn: 3, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 3)
+  assert.equal(agent.steers.length, 1, 'precondition: the first advisory speaks and starts the hour')
+  // Simulate the first speak being 40 minutes ago, so the credential stop is
+  // still inside the hour and needs the bypass.
+  ageLastAdvisory(svc, agent, 40 * 60 * 1000)
+  begin(svc, agent, 4)
+  prompt(svc, agent, 4)
+  announce(svc, agent, { turn: 4, cwd: repo, files: ['app.js'], diffs: [['+password = "hunter2hunter2"']] })
+  await stop(svc, agent, 4)
+  assert.equal(agent.steers.length, 2, 'precondition: the credential stop inside the hour must speak by bypass')
+  const credentialSpeakAt = svc.state(agent).lastAdvisoryAt
+  assert.ok(credentialSpeakAt !== null, 'precondition: the credential speak must record a speak time')
+  // Simulate 30 minutes passing since the credential speak: still inside the
+  // restarted hour, but 70 minutes after the first speak, so only a restarted
+  // hour holds the next non-credential stop.
+  svc.state(agent).lastAdvisoryAt = credentialSpeakAt - 30 * 60 * 1000
+  begin(svc, agent, 5)
+  prompt(svc, agent, 5)
+  announce(svc, agent, { turn: 5, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 5)
+  assert.equal(agent.steers.length, 2, 'a non-credential stop after a credential speak must be held by the restarted hour')
+  // At/after the restarted hour the held advisory speaks.
+  svc.state(agent).lastAdvisoryAt = credentialSpeakAt - HOUR_MS - 1000
+  begin(svc, agent, 6)
+  prompt(svc, agent, 6)
+  announce(svc, agent, { turn: 6, cwd: repo, files: ['app.js'], diffs: [[]] })
+  await stop(svc, agent, 6)
+  assert.equal(agent.steers.length, 3, 'the held advisory must speak at the first prompt-eligible stop at/after the restarted hour')
+  assert.ok(steerText(agent.steers[2]).includes(`Root: ${repo}`), 'the spoken held advisory must name the repository')
+})
+
 test('review P3: when both catalog and archive are unreadable the next step repairs both before registering', () => {
   const { catalogPath, archivePath } = reportPaths()
   const repo = reportRepo({ catalog: { path: catalogPath, state: 'unreadable', items: [], problem: 'the file is not valid JSON: boom' } })
