@@ -269,11 +269,11 @@ test('ticket 3: an already-stated archived item keeps its obligation and attests
   await svc.__tool.execute({ action: 'register', repository_root: session, items: [{ name: 'Extra', proves: 'Extra proves.' }] }, execOf(secondAgent(session)))
   assert.equal(JSON.parse(fs.readFileSync(path.join(session, '.dsh', 'verification.json'), 'utf8')).items.some(item => item.id === 'unit'), false, 'precondition: unit left the active catalog')
   const lines = await linesOf(svc, a)
-  assert.ok(lines.includes('- unit: Unit | passed'), `the stated archived item keeps its line and state:\n${lines.join('\n')}`)
+  assert.ok(lines.includes('- unit: Unit | passed (archived)'), `the stated archived item keeps its line and state:\n${lines.join('\n')}`)
   assert.ok(lines.includes('Active catalog items: 1'), `the archived item is no longer counted active:\n${lines.join('\n')}`)
   const again = await svc.__tool.execute(completeAttest(session), execOf(a))
   assert.equal(again.pass, true, again.markdown)
-  assert.ok(again.markdown.includes('- unit: Unit | passed'), 'the archived obligation attests intact')
+  assert.ok(again.markdown.includes('- unit: Unit | passed (archived)'), 'the archived obligation attests intact')
 })
 
 test('ticket 3: a session newly adopts an archived item by id after another register archives it', async t => {
@@ -282,9 +282,9 @@ test('ticket 3: a session newly adopts an archived item by id after another regi
   await svc.__tool.execute({ action: 'register', repository_root: session, items: [{ name: 'Extra', proves: 'Extra proves.' }] }, execOf(secondAgent(session)))
   const attested = await svc.__tool.execute(completeAttest(session), execOf(a))
   assert.equal(attested.pass, true, attested.markdown)
-  assert.ok(attested.markdown.includes('- unit: Unit | passed'), 'the archived id is adopted by stating it')
+  assert.ok(attested.markdown.includes('- unit: Unit | passed (archived)'), 'the archived id is adopted by stating it')
   const lines = await linesOf(svc, a)
-  assert.ok(lines.includes('- unit: Unit | passed'), `the adopted archived item is listed:\n${lines.join('\n')}`)
+  assert.ok(lines.includes('- unit: Unit | passed (archived)'), `the adopted archived item is listed:\n${lines.join('\n')}`)
 })
 
 test('ticket 3: evaluateRepository reports a stated archived item under its archived state', () => {
