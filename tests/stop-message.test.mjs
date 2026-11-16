@@ -1467,3 +1467,42 @@ test('ticket 3: register through the tool handler renders an active-write failur
     cause: 'simulated rename failure',
   })
 })
+
+// Review finding P3 (catalog-spam): advisory instructions must respect an unreadable archive. A new session with only
+// an unreadable archive must not be told to adopt/register; it must be directed to repair the archive first.
+test('review P3: a new session with only an unreadable archive repairs the archive before any adoption or registration', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'readable', items: [], problem: null } })
+  repo.introduced = false
+  repo.problems = [`The archive at ${archivePath} cannot be read: the file is not valid JSON: boom.`]
+  const text = advisoryMessage({ repositories: [repo] })
+  const intro = text.split('\n').find(line => line.startsWith('This repository is new'))
+  assert.ok(intro, `the advisory must introduce the repository: ${text}`)
+  assert.doesNotMatch(intro, /Read it, adopt/, `the introduction must not tell the session to adopt items while the archive is unreadable: ${intro}`)
+  assert.doesNotMatch(intro, /register the items you will run/, `the introduction must not tell the session to register items while the archive is unreadable: ${intro}`)
+  assert.ok(intro.includes(archivePath), `the introduction must name the unreadable archive: ${intro}`)
+  assert.match(intro, /verification archive.*cannot be read/, 'the introduction must say the archive cannot be read')
+  assert.match(intro, /Repair it so it reads again/i, 'the introduction must direct repair of the archive')
+  assert.match(intro, /do not register items until/i, 'the introduction must defer registration until the archive reads again')
+  assertAdvisory(text)
+})
+
+// Review finding P3 (catalog-spam): when both catalog and archive are unreadable, the next step must name BOTH repairs
+// before any registration, because registering still refuses until the archive is repaired too.
+test('review P3: when both catalog and archive are unreadable the next step repairs both before registering', () => {
+  const { catalogPath, archivePath } = reportPaths()
+  const repo = reportRepo({ catalog: { path: catalogPath, state: 'unreadable', items: [], problem: 'the file is not valid JSON: boom' } })
+  repo.problems = [`The archive at ${archivePath} cannot be read: the file is not valid JSON: boom.`]
+  const text = advisoryMessage({ repositories: [repo] })
+  const next = text.split('\n').find(line => line.startsWith('Next:'))
+  assert.ok(next, `the advisory must carry a next step: ${text}`)
+  assert.ok(next.includes('repair the verification catalog'), `the next step must name the catalog repair: ${next}`)
+  assert.ok(next.includes('repair the verification archive'), `the next step must name the archive repair: ${next}`)
+  assert.ok(next.includes(catalogPath), `the next step must name the catalog path: ${next}`)
+  assert.ok(next.includes(archivePath), `the next step must name the archive path: ${next}`)
+  const catalogAt = next.indexOf('repair the verification catalog')
+  const archiveAt = next.indexOf('repair the verification archive')
+  const registerAt = next.indexOf('then register')
+  assert.ok(catalogAt >= 0 && archiveAt >= 0 && registerAt > catalogAt && registerAt > archiveAt, `both repairs must precede registration: ${next}`)
+  assertAdvisory(text)
+})
