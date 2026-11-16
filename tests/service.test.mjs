@@ -598,9 +598,9 @@ test('a repository that cannot be read is named in status, and the next status r
   assert.ok(second.markdown.includes(`Root: ${session}`), 'the next status must read the turn again')
 })
 
-// The catalog section of status: each repository's items, one line per item. The item line format is fixed here:
-// "- <id>: <name> | Proves: <proves> | Command: <command or none>".
-test('status lists the catalog items of two repositories', async t => {
+// The catalog section of status: the catalog path, the archive path, and the active count of each repository, with no
+// unstated item listed.
+test('status prints the paths and count of two repositories instead of listing unstated catalog items', async t => {
   const session = tempGitRepo(t)
   const sibling = tempGitRepo(t)
   const summaries = new Map()
@@ -612,9 +612,45 @@ test('status lists the catalog items of two repositories', async t => {
   await svc.__tool.execute({ action: 'register', repository_root: sibling, items: [{ name: 'Smoke', proves: 'It starts.', command: 'node smoke.js' }] }, { agent: a, signal: new AbortController().signal })
   const result = await svc.__tool.execute({ action: 'status' }, { agent: a, signal: new AbortController().signal })
   const lines = result.markdown.split('\n')
-  assert.ok(lines.includes('- lint: Lint | Proves: No lint errors. | Command: none'), result.markdown)
-  assert.ok(lines.includes('- smoke: Smoke | Proves: It starts. | Command: node smoke.js'), result.markdown)
-  assert.ok(lines.includes(`Catalog: ${path.join(sibling, '.dsh', 'verification.json')}`), result.markdown)
+  assert.ok(lines.includes(`Catalog path: ${path.join(session, '.dsh', 'verification.json')}`), result.markdown)
+  assert.ok(lines.includes(`Archive path: ${path.join(session, '.dsh', 'verification-archive.json')}`), result.markdown)
+  assert.ok(lines.includes(`Catalog path: ${path.join(sibling, '.dsh', 'verification.json')}`), result.markdown)
+  assert.ok(lines.includes(`Archive path: ${path.join(sibling, '.dsh', 'verification-archive.json')}`), result.markdown)
+  assert.equal(lines.filter(line => line === 'Active catalog items: 1').length, 2, result.markdown)
+  assert.equal(lines.some(line => line.startsWith('- lint:')), false, 'an unstated item has no per-item line')
+  assert.equal(lines.some(line => line.startsWith('- smoke:')), false, 'an unstated item has no per-item line')
+  assert.doesNotMatch(result.markdown, /No lint errors|It starts|Proves:/, 'no unstated item text reaches the report')
+})
+
+// Ticket 3: two sessions registering the same repository root serialize, so the second read-modify-write starts only
+// after the first commits and no item is lost. Git is slowed through a PATH wrapper, so both sessions' reads complete
+// before any write when the serialization is dropped: without the per-repository queue the later write overwrites the
+// earlier one and one item is lost.
+test('two sessions registering the same root serialize and lose no items', async t => {
+  const session = tempGitRepo(t)
+  const summaries = new Map()
+  const svc = statusService(summaries)
+  t.after(() => cleanupService(svc))
+  const a = agent([], { cwd: session })
+  const b = { ...agent([], { cwd: session }), id: 'b' }
+  const binDir = makeWorkDir('git-bin-')
+  const gitBin = process.env.PATH.split(path.delimiter).map(dir => path.join(dir, 'git')).find(file => fs.existsSync(file))
+  assert.ok(gitBin, 'git must be on PATH for the slow-git wrapper')
+  fs.writeFileSync(path.join(binDir, 'git'), `#!/bin/sh\nsleep 0.5\nexec ${gitBin} "$@"\n`)
+  fs.chmodSync(path.join(binDir, 'git'), 0o755)
+  const oldPath = process.env.PATH
+  process.env.PATH = `${binDir}:${oldPath}`
+  t.after(() => { process.env.PATH = oldPath })
+  announceTurn(svc, a, summaries, 1, session, ['app.js'])
+  announceTurn(svc, b, summaries, 1, session, ['app.js'])
+  const [first, second] = await Promise.all([
+    svc.__tool.execute({ action: 'register', repository_root: session, items: [{ name: 'Alpha', proves: 'Alpha proves.' }] }, execOf(a)),
+    svc.__tool.execute({ action: 'register', repository_root: session, items: [{ name: 'Beta', proves: 'Beta proves.' }] }, execOf(b)),
+  ])
+  assert.ok(first.markdown.includes('- alpha: Alpha (registered)'), first.markdown)
+  assert.ok(second.markdown.includes('- beta: Beta (registered)'), second.markdown)
+  const catalog = JSON.parse(fs.readFileSync(path.join(session, '.dsh', 'verification.json'), 'utf8'))
+  assert.deepEqual(catalog.items.map(item => item.id).sort(), ['alpha', 'beta'], 'both items survive the concurrent registers')
 })
 
 // A repository with no catalog says so. A catalog that cannot be parsed is named as unreadable with its problem, and is

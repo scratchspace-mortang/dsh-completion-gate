@@ -5,6 +5,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { CompletionGateService } from '../lib/index.js'
+import { readCatalog } from '../lib/catalog.js'
+import { evaluateRepository, planAttest } from '../lib/tracker.js'
 
 // The tracker is tested through CompletionGateService and a stub host, the same seam service.test.mjs uses. The stub
 // is copied here rather than imported, because importing service.test.mjs would run its tests a second time.
@@ -202,7 +204,7 @@ test('status names each unmet obligation in the stated wording', async t => {
   assert.ok(lines.includes('Status: unfinished'))
 })
 
-test('a catalog with one stated item and one unstated item lists the stated item and one summary line', async t => {
+test('a catalog with one stated item and one unstated item prints paths and count, the stated item, and one summary line', async t => {
   const { session, svc, a } = await attestFixture(t)
   await svc.__tool.execute({ action: 'register', repository_root: session, items: [{ name: 'Audit', proves: 'the audit log is complete' }] }, execOf(a))
   const attested = await svc.__tool.execute(completeAttest(session), execOf(a))
@@ -210,15 +212,150 @@ test('a catalog with one stated item and one unstated item lists the stated item
   const lines = await linesOf(svc, a)
   const summary = 'Unstated catalog items: 1 (history; no action required unless adopted).'
   assert.equal(lines.filter(line => line === summary).length, 1, `the report names the unstated count once:\n${lines.join('\n')}`)
-  const catalogAt = lines.indexOf('Catalog readable, 2 items:')
-  assert.ok(catalogAt >= 0, `the catalog reading list is printed:\n${lines.join('\n')}`)
-  assert.ok(lines.indexOf(summary) < catalogAt, 'the summary line comes before the full catalog reading list')
-  assert.ok(lines.includes('- unit: Unit | Proves: app.js sets value | Command: none'), 'the reading list keeps the stated item and its proves note')
-  assert.ok(lines.includes('- audit: Audit | Proves: the audit log is complete | Command: none'), 'the reading list keeps the unstated item and its proves note')
+  assert.ok(lines.includes(`Catalog path: ${path.join(session, '.dsh', 'verification.json')}`), `the catalog path is printed:\n${lines.join('\n')}`)
+  assert.ok(lines.includes(`Archive path: ${path.join(session, '.dsh', 'verification-archive.json')}`), `the archive path is printed:\n${lines.join('\n')}`)
+  assert.ok(lines.includes('Active catalog items: 2'), `the active count is printed:\n${lines.join('\n')}`)
+  assert.ok(lines.indexOf(summary) < lines.indexOf(`Catalog path: ${path.join(session, '.dsh', 'verification.json')}`), 'the summary line comes before the catalog section')
   assert.ok(lines.includes('- unit: Unit | passed'), 'the stated item is listed with its state')
-  assert.ok(!lines.includes('- audit: Audit | not stated'), 'the unstated item has no per-item line')
+  assert.ok(!lines.some(line => line.startsWith('- audit:')), 'the unstated item has no per-item line')
+  assert.ok(!lines.join('\n').includes('the audit log is complete'), 'the unstated item proves text reaches no report')
   assert.ok(!lines.some(line => line.startsWith('- Catalog item not stated')), 'the unstated item adds no problem')
   assert.ok(lines.includes('Status: complete'), 'the unstated item is not an obligation, so the repository is complete')
+})
+
+// Ticket 3 test helpers: catalog aging (so another session's register archives), file seeding, and a snapshot for the
+// pure evaluation functions.
+const TICKET3_DAY_MS = 24 * 60 * 60 * 1000
+
+function ageCatalogItems(session, days = 3) {
+  const file = path.join(session, '.dsh', 'verification.json')
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+  const stamp = new Date(Date.now() - days * TICKET3_DAY_MS).toISOString()
+  for (const item of data.items) item.updatedAt = stamp
+  fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`)
+}
+
+function seedCatalogFile(session, name, items) {
+  const file = path.join(session, '.dsh', name)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, `${JSON.stringify({ version: 1, items }, null, 2)}\n`)
+}
+
+function ticket3Item(id, name, updatedAt, extra = {}) {
+  return { id, name, proves: `Proves ${name}.`, addedAt: updatedAt, updatedAt, ...extra }
+}
+
+function snapshotFor(session, statedIds) {
+  return {
+    root: session, label: 'repo', catalogPath: path.join(session, '.dsh', 'verification.json'),
+    files: [],
+    itemStates: statedIds.map(id => ({ id, state: 'passed', reason: undefined })),
+    attestation: { digest: 'digest', summary: '', createdAt: 0 }, introduced: false, stale: false,
+  }
+}
+
+function secondAgent(session) {
+  const other = agent({ cwd: session })
+  other.id = 'b'
+  return other
+}
+
+test('ticket 3: an already-stated archived item keeps its obligation and attests intact', async t => {
+  const { session, svc, a } = await attestFixture(t)
+  const first = await svc.__tool.execute(completeAttest(session), execOf(a))
+  assert.equal(first.pass, true, first.markdown)
+  // Another session's register archives the aged item, so it lives only in the archive.
+  ageCatalogItems(session)
+  await svc.__tool.execute({ action: 'register', repository_root: session, items: [{ name: 'Extra', proves: 'Extra proves.' }] }, execOf(secondAgent(session)))
+  assert.equal(JSON.parse(fs.readFileSync(path.join(session, '.dsh', 'verification.json'), 'utf8')).items.some(item => item.id === 'unit'), false, 'precondition: unit left the active catalog')
+  const lines = await linesOf(svc, a)
+  assert.ok(lines.includes('- unit: Unit | passed'), `the stated archived item keeps its line and state:\n${lines.join('\n')}`)
+  assert.ok(lines.includes('Active catalog items: 1'), `the archived item is no longer counted active:\n${lines.join('\n')}`)
+  const again = await svc.__tool.execute(completeAttest(session), execOf(a))
+  assert.equal(again.pass, true, again.markdown)
+  assert.ok(again.markdown.includes('- unit: Unit | passed'), 'the archived obligation attests intact')
+})
+
+test('ticket 3: a session newly adopts an archived item by id after another register archives it', async t => {
+  const { session, svc, a } = await attestFixture(t)
+  ageCatalogItems(session)
+  await svc.__tool.execute({ action: 'register', repository_root: session, items: [{ name: 'Extra', proves: 'Extra proves.' }] }, execOf(secondAgent(session)))
+  const attested = await svc.__tool.execute(completeAttest(session), execOf(a))
+  assert.equal(attested.pass, true, attested.markdown)
+  assert.ok(attested.markdown.includes('- unit: Unit | passed'), 'the archived id is adopted by stating it')
+  const lines = await linesOf(svc, a)
+  assert.ok(lines.includes('- unit: Unit | passed'), `the adopted archived item is listed:\n${lines.join('\n')}`)
+})
+
+test('ticket 3: evaluateRepository reports a stated archived item under its archived state', () => {
+  const session = attestRepo()
+  const old = new Date(Date.now() - 3 * TICKET3_DAY_MS).toISOString()
+  const fresh = new Date(Date.now() - TICKET3_DAY_MS).toISOString()
+  seedCatalogFile(session, 'verification.json', [ticket3Item('fresh-item', 'Fresh item', fresh)])
+  seedCatalogFile(session, 'verification-archive.json', [ticket3Item('old-item', 'Old item', old)])
+  const evaluated = evaluateRepository(snapshotFor(session, ['old-item']), readCatalog(session))
+  assert.deepEqual(evaluated.items, [{ id: 'old-item', name: 'Old item', state: 'passed', reason: undefined, archived: true }])
+  assert.equal(evaluated.unstatedCount, 1, 'the unstated count counts active items only')
+  assert.equal(evaluated.complete, true, evaluated.problems.join(' '))
+})
+
+test('ticket 3: duplicate ids resolve to the newer updatedAt copy, ties to the archived copy', () => {
+  const session = attestRepo()
+  const newer = new Date(Date.now() - TICKET3_DAY_MS).toISOString()
+  const older = new Date(Date.now() - 3 * TICKET3_DAY_MS).toISOString()
+  seedCatalogFile(session, 'verification.json', [ticket3Item('dup-item', 'Active name', newer)])
+  seedCatalogFile(session, 'verification-archive.json', [ticket3Item('dup-item', 'Archived name', older)])
+  let evaluated = evaluateRepository(snapshotFor(session, ['dup-item']), readCatalog(session))
+  assert.equal(evaluated.items[0].name, 'Active name', 'the newer active copy wins')
+  assert.equal(evaluated.items[0].archived, false)
+  seedCatalogFile(session, 'verification.json', [ticket3Item('dup-item', 'Active name', older)])
+  seedCatalogFile(session, 'verification-archive.json', [ticket3Item('dup-item', 'Archived name', newer)])
+  evaluated = evaluateRepository(snapshotFor(session, ['dup-item']), readCatalog(session))
+  assert.equal(evaluated.items[0].name, 'Archived name', 'the newer archived copy wins')
+  assert.equal(evaluated.items[0].archived, true)
+  seedCatalogFile(session, 'verification.json', [ticket3Item('dup-item', 'Active name', older)])
+  seedCatalogFile(session, 'verification-archive.json', [ticket3Item('dup-item', 'Archived name', older)])
+  evaluated = evaluateRepository(snapshotFor(session, ['dup-item']), readCatalog(session))
+  assert.equal(evaluated.items[0].name, 'Archived name', 'equal timestamps resolve to the archived copy')
+  assert.equal(evaluated.items[0].archived, true)
+})
+
+test('ticket 3: an unreadable archive is a reported problem in evaluation, not a silent drop', () => {
+  const session = attestRepo()
+  const fresh = new Date(Date.now() - TICKET3_DAY_MS).toISOString()
+  seedCatalogFile(session, 'verification.json', [ticket3Item('fresh-item', 'Fresh item', fresh)])
+  fs.mkdirSync(path.join(session, '.dsh'), { recursive: true })
+  fs.writeFileSync(path.join(session, '.dsh', 'verification-archive.json'), '{"version": 1, "items": [\n')
+  const evaluated = evaluateRepository(snapshotFor(session, ['old-item']), readCatalog(session))
+  const problem = evaluated.problems.find(text => text.includes('verification-archive.json'))
+  assert.ok(problem, `the archive is named in a problem: ${evaluated.problems.join(' ')}`)
+  assert.match(problem, /cannot be read/)
+  assert.equal(evaluated.complete, false)
+})
+
+test('ticket 3: planAttest accepts an archived id and refuses a name that is in neither file', async () => {
+  const session = attestRepo()
+  const old = new Date(Date.now() - 3 * TICKET3_DAY_MS).toISOString()
+  const fresh = new Date(Date.now() - TICKET3_DAY_MS).toISOString()
+  seedCatalogFile(session, 'verification.json', [ticket3Item('fresh-item', 'Fresh item', fresh)])
+  seedCatalogFile(session, 'verification-archive.json', [ticket3Item('old-item', 'Old item', old)])
+  const snapshot = snapshotFor(session, [])
+  const plan = await planAttest(snapshot, { items: [{ id: 'old-item', state: 'passed' }] }, readCatalog(session), session)
+  assert.deepEqual(plan.items, [{ id: 'old-item', state: 'passed' }])
+  await assert.rejects(planAttest(snapshot, { items: [{ id: 'missing-item', state: 'passed' }] }, readCatalog(session), session), /missing-item is not an item/)
+})
+
+test('ticket 3: planAttest with an unreadable archive reports the archive problem for an id not in the active catalog', async () => {
+  const session = attestRepo()
+  const fresh = new Date(Date.now() - TICKET3_DAY_MS).toISOString()
+  seedCatalogFile(session, 'verification.json', [ticket3Item('fresh-item', 'Fresh item', fresh)])
+  fs.mkdirSync(path.join(session, '.dsh'), { recursive: true })
+  fs.writeFileSync(path.join(session, '.dsh', 'verification-archive.json'), '{"version": 1, "items": [\n')
+  const snapshot = snapshotFor(session, [])
+  await assert.rejects(planAttest(snapshot, { items: [{ id: 'old-item', state: 'passed' }] }, readCatalog(session), session), /archive/i)
+  // An active id still resolves without the archive.
+  const plan = await planAttest(snapshot, { items: [{ id: 'fresh-item', state: 'passed' }] }, readCatalog(session), session)
+  assert.deepEqual(plan.items, [{ id: 'fresh-item', state: 'passed' }])
 })
 
 test('a repository with no changed files and only unstated items is complete', async t => {

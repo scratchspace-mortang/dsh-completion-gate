@@ -61,14 +61,18 @@ function service({ workspaceChanges = recorder(), settings = {} } = {}) {
   fs.mkdirSync(workRoot, { recursive: true })
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'settings-')))
   const listeners = new Map()
+  const tools = {}
   const off = () => () => {}
   const ctx = {
     reflect: { get: name => (name === 'workspaceChanges' ? workspaceChanges : undefined) },
     on: (name, listener) => { listeners.set(name, listener); return off() },
-    provide: off, tools: { register: off }, commands: { register: off }, systemPrompt: { section: off }, webServer: { register: off },
+    provide: off,
+    tools: { register: definition => { tools.completion_gate = definition; return off() } },
+    commands: { register: off }, systemPrompt: { section: off }, webServer: { register: off },
   }
   const instance = new CompletionGateService(ctx, settings, { settingsPath: path.join(dir, 'settings.json') })
   instance.start()
+  instance.__tool = tools.completion_gate
   let published = 0
   // Publishes one event the way the host does, and returns the sequence the event was given.
   instance.publish = (agent, type, data) => {
@@ -1230,4 +1234,91 @@ test('a credential is named even when the repository report fails', async () => 
   const text = steerText(agent.steers[0])
   assert.match(text, /could not evaluate the workspace/, 'the failure is still named')
   assert.match(text, /Possible hard-coded credential or secret/, 'the readable changed lines must still be scanned')
+})
+
+// Ticket 3 tool-level regressions: a register refused by an archive problem must reach the model as failure markdown
+// through the tool handler, naming the path and cause with no success indication. Makes the first rename onto the named
+// file throw, simulating a failed atomic write. Returns a restore function.
+function failRenameOnce(fileName) {
+  const original = fs.renameSync
+  let done = false
+  fs.renameSync = (src, dest) => {
+    if (!done && String(dest).endsWith(fileName)) { done = true; throw new Error('simulated rename failure') }
+    return original(src, dest)
+  }
+  return () => { fs.renameSync = original }
+}
+
+function seedStaleCatalog(repo) {
+  fs.mkdirSync(path.join(repo, '.dsh'), { recursive: true })
+  const stamp = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString()
+  const items = [{ id: 'old-item', name: 'Old item', proves: 'Old proves.', addedAt: stamp, updatedAt: stamp }]
+  fs.writeFileSync(path.join(repo, '.dsh', 'verification.json'), `${JSON.stringify({ version: 1, items }, null, 2)}\n`)
+}
+
+function registerThroughTool(svc, agent, repo) {
+  return svc.__tool.execute({ action: 'register', repository_root: repo, items: [{ name: 'Incoming', proves: 'Incoming proves.' }] }, { agent, signal: new AbortController().signal })
+}
+
+function assertFailureMarkdown(markdown, { catalogPath, archivePath, cause }) {
+  assert.ok(markdown.includes(catalogPath), `the catalog path must be named: ${markdown}`)
+  assert.ok(markdown.includes(archivePath), `the archive path must be named: ${markdown}`)
+  assert.match(markdown, /Archive problem:/, 'the failure is named')
+  assert.ok(markdown.includes(cause), `the cause must be named: ${markdown}`)
+  assert.doesNotMatch(markdown, /registered|updated/, 'a refused register shows no success indication')
+  assert.doesNotMatch(markdown, /^- incoming:/m, 'no incoming item is listed as written')
+}
+
+test('ticket 3: register through the tool handler renders an unreadable archive as failure markdown', async () => {
+  const repo = changedRepo('tool-unreadable-archive')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent)
+  announce(svc, agent, { cwd: repo, files: ['app.js'] })
+  const archivePath = path.join(repo, '.dsh', 'verification-archive.json')
+  fs.mkdirSync(path.join(repo, '.dsh'), { recursive: true })
+  fs.writeFileSync(archivePath, '{"version": 1, "items": [\n')
+  const result = await registerThroughTool(svc, agent, repo)
+  assertFailureMarkdown(result.markdown, {
+    catalogPath: path.join(repo, '.dsh', 'verification.json'), archivePath,
+    cause: 'the file is not valid JSON',
+  })
+})
+
+test('ticket 3: register through the tool handler renders an archive-write failure as failure markdown', async () => {
+  const repo = changedRepo('tool-archive-write-failure')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent)
+  announce(svc, agent, { cwd: repo, files: ['app.js'] })
+  seedStaleCatalog(repo)
+  const restore = failRenameOnce('verification-archive.json')
+  let result
+  try { result = await registerThroughTool(svc, agent, repo) }
+  finally { restore() }
+  assertFailureMarkdown(result.markdown, {
+    catalogPath: path.join(repo, '.dsh', 'verification.json'),
+    archivePath: path.join(repo, '.dsh', 'verification-archive.json'),
+    cause: 'simulated rename failure',
+  })
+})
+
+test('ticket 3: register through the tool handler renders an active-write failure as failure markdown', async () => {
+  const repo = changedRepo('tool-active-write-failure')
+  const svc = service()
+  const agent = agentFor(repo)
+  begin(svc, agent)
+  announce(svc, agent, { cwd: repo, files: ['app.js'] })
+  seedStaleCatalog(repo)
+  const catalogPath = path.join(repo, '.dsh', 'verification.json')
+  const restore = failRenameOnce('verification.json')
+  let result
+  try { result = await registerThroughTool(svc, agent, repo) }
+  finally { restore() }
+  // The archive move is durable, so the stale item is a duplicate until the retry; either way the markdown names the
+  // failing catalog path and cause with no success indication.
+  assertFailureMarkdown(result.markdown, {
+    catalogPath, archivePath: path.join(repo, '.dsh', 'verification-archive.json'),
+    cause: 'simulated rename failure',
+  })
 })

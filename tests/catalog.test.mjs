@@ -269,7 +269,7 @@ test('register in a subdirectory of a repository excludes its catalog in that re
   assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: repo, encoding: 'utf8' }).trim(), '', 'the enclosing repository stays clean')
 })
 
-test('register keeps the item text as entered, and the register and status reports still show each item on one line', async t => {
+test('register keeps the item text as entered, and status prints paths and count instead of the unstated item', async t => {
   const repo = gitRepo()
   const svc = gateFor(t)
   const a = agentIn(repo)
@@ -278,10 +278,16 @@ test('register keeps the item text as entered, and the register and status repor
   assert.equal(stored.name, 'Lint\n## Forged name', 'the catalog holds the name as entered')
   assert.equal(stored.proves, 'Line one\n### Forged heading', 'the catalog holds the proves text as entered')
   assert.equal(result.markdown.split('\n').some(line => line.startsWith('## Forged')), false, 'the register report starts no heading from the name')
+  assert.equal(result.markdown.split('\n').filter(line => line === '- lint-forged-name: Lint ## Forged name (registered)').length, 1, 'the register report lists the written item on one line')
   const { markdown } = await svc.__tool.execute({ action: 'status' }, { agent: a, signal: signal() })
   const lines = markdown.split('\n')
   assert.equal(lines.some(line => line.startsWith('## Forged') || line.startsWith('### Forged')), false, 'the status report starts no heading from the item text')
-  assert.equal(lines.filter(line => line.startsWith('- lint-forged-name: Lint ## Forged name | Proves: Line one ### Forged heading')).length, 1, 'the status item is one line')
+  assert.ok(lines.includes(`Catalog path: ${path.join(repo, '.dsh', 'verification.json')}`), markdown)
+  assert.ok(lines.includes(`Archive path: ${path.join(repo, '.dsh', 'verification-archive.json')}`), markdown)
+  assert.ok(lines.includes('Active catalog items: 1'), markdown)
+  assert.ok(lines.includes('Unstated catalog items: 1 (history; no action required unless adopted).'), markdown)
+  assert.equal(lines.some(line => line.startsWith('- lint-forged-name:')), false, 'an unstated item has no per-item line in the status report')
+  assert.equal(markdown.includes('Line one'), false, 'the unstated item proves text reaches no report')
 })
 
 test('an unreadable catalog quotes its text on one line in the status report', async t => {
