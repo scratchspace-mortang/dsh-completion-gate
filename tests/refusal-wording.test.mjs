@@ -449,6 +449,62 @@ test('T1 overlap is checked within one path argument, not across arguments', asy
   assert.equal(entry.adopted, true, 'the adoption across arguments was applied')
 })
 
+// T1 (OCR-CODE-T1-R2-9): the per-argument overlap check covers every descriptor, not just
+// claims. A group and an exact entry naming one filed path in adopted_files or
+// demonstrated_files are refused by name and write nothing.
+test('T1 an adopted group and exact entry naming one filed path are refused by name with nothing written', async t => {
+  const repo = tempRepo()
+  for (const name of ['lib/one.js', 'lib/two.js']) {
+    const target = path.join(repo, name)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, 'export const one = 1\n')
+  }
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('lib/one.js'), file('lib/two.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const shared = path.join(repo, 'lib/one.js')
+  const error = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    adopted_files: ['lib/', 'lib/one.js'],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(error, 'an adopted group and exact entry over one path must refuse')
+  const message = error.errors?.join('\n') ?? error.message
+  assert.ok(message.includes(shared), `the refusal names the overlapping path ${shared}: ${message}`)
+  assert.match(message, /named by both lib\/ and lib\/one\.js/, 'the refusal names the two entries that share the path')
+  const entry = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files).find(f => f.absolute === shared)
+  assert.equal(entry.adopted, false, 'no adopted state was written')
+})
+
+test('T1 a demonstrated group and exact entry naming one filed path are refused by name with nothing written', async t => {
+  const repo = tempRepo()
+  for (const name of ['lib/one.js', 'lib/two.js']) {
+    const target = path.join(repo, name)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, 'export const one = 1\n')
+  }
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('lib/one.js'), file('lib/two.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const shared = path.join(repo, 'lib/one.js')
+  const error = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    demonstrated_files: [{ path: 'lib/', note: 'ran the fixture' }, { path: 'lib/one.js', note: 'ran the fixture' }],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(error, 'a demonstrated group and exact entry over one path must refuse')
+  const message = error.errors?.join('\n') ?? error.message
+  assert.ok(message.includes(shared), `the refusal names the overlapping path ${shared}: ${message}`)
+  assert.match(message, /named by both lib\/ and lib\/one\.js/, 'the refusal names the two entries that share the path')
+  const entry = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files).find(f => f.absolute === shared)
+  assert.equal(entry.reviewed, false, 'no reviewed state was written')
+  assert.equal(entry.demonstrated, null, 'no demonstrated state was written')
+})
+
 // T1 (OCR-CODE-T1-R1-5): two identical exact values in reviewed_code_files or adopted_files
 // are permitted by the schema and were accepted before grouping. They resolve idempotently
 // to one filed path and must not be refused as an ambiguous overlap of a path with itself.
@@ -473,6 +529,55 @@ test('duplicate exact reviewed and adopted entries stay accepted', async t => {
   const entry = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, 'ab.js'))
   assert.equal(entry.reviewed, true, 'the duplicated review applied')
   assert.equal(entry.adopted, true, 'the duplicated adoption applied')
+})
+
+// T1 (OCR-CODE-T1-R2-3): identical spellings are one entry repeated and stay accepted, but two
+// different spellings that resolve to one filed path name that path twice. The exact/exact
+// overlap refusal must name the shared absolute path and write nothing.
+test('two different exact spellings of one filed path are refused as ambiguous', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'ab.js'), 'export const ab = 1\n')
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('ab.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const shared = path.join(repo, 'ab.js')
+  const error = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    reviewed_code_files: ['./ab.js', 'ab.js'],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(error, 'two spellings of one filed path must refuse')
+  const message = error.errors?.join('\n') ?? error.message
+  assert.ok(message.includes(shared), `the refusal names the shared absolute path ${shared}: ${message}`)
+  assert.match(message, /named by both|ambiguous/i, 'the refusal names the overlap, not an unfiled path')
+  const entry = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files).find(f => f.absolute === shared)
+  assert.equal(entry.reviewed, false, 'no reviewed state was written')
+  assert.equal(entry.adopted, false, 'no adopted state was written')
+})
+
+// T1 (OCR-CODE-T1-R2-2): reviewed_code_files has no schema duplicate refusal, so two identical
+// exact spellings of one credited path must still produce one adoption-refusal line, not one per
+// spelling. The plan deduplicates reviewed paths before the adoption loop reports them.
+test('duplicate exact reviews of a child-written file emit one adoption refusal', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'ab.js'), 'export const ab = 1\n')
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  const child = childOf(repo, parent.id, 'child-1', 1)
+  parentIdleTurn(svc, parent, 1)
+  writerTurn(svc, child, 1, 'ab.js')
+  const agent = agentFor(repo, parent.id)
+  const error = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    reviewed_code_files: ['ab.js', 'ab.js'],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(error, 'covering a credited file with a review requires adoption')
+  const refusals = (error.errors ?? [error.message]).filter(line => /was written by child-1, so covering it with a review requires listing it in adopted_files/.test(line))
+  assert.equal(refusals.length, 1, `one adoption refusal for one path: ${JSON.stringify(error.errors ?? error.message)}`)
 })
 
 // T1 (OCR-CODE-T1-R1-6): a group naming no filed path gets its own next action. A group claim
@@ -508,6 +613,28 @@ test('a group naming no filed path names the exact claim that files the concrete
   const reviewMessage = reviewRefusal.errors?.join('\n') ?? reviewRefusal.message
   assert.match(reviewMessage, /exact value|exact claim|exact path/i, 'the non-claim refusal also names the exact-claim next action')
   assert.doesNotMatch(reviewMessage, /a claim is the route that files it/, 'the non-claim refusal does not promise the group claim files it')
+
+  // The adopted and demonstrated descriptor rows share this wording. A group-only claim flag
+  // leak in either row adds the claim-only clause, which is false for those entries.
+  const adoptedRefusal = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    adopted_files: ['concrete*'],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(adoptedRefusal, 'an adopted group naming no filed path must refuse')
+  const adoptedMessage = adoptedRefusal.errors?.join('\n') ?? adoptedRefusal.message
+  assert.match(adoptedMessage, /exact value|exact claim|exact path/i, 'the adopted refusal names the exact-claim action')
+  assert.doesNotMatch(adoptedMessage, /so this grouped claim files nothing/, 'the adopted refusal does not use claim-only wording')
+
+  const demonstratedRefusal = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    demonstrated_files: [{ path: 'concrete*', note: 'ran the fixture' }],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(demonstratedRefusal, 'a demonstrated group naming no filed path must refuse')
+  const demonstratedMessage = demonstratedRefusal.errors?.join('\n') ?? demonstratedRefusal.message
+  assert.match(demonstratedMessage, /exact value|exact claim|exact path/i, 'the demonstrated refusal names the exact-claim action')
+  assert.doesNotMatch(demonstratedMessage, /so this grouped claim files nothing/, 'the demonstrated refusal does not use claim-only wording')
 
   const accepted = await svc.attest(agent, {
     action: 'attest', repository_root: repo,

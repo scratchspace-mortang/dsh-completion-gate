@@ -591,6 +591,7 @@ test('regression: symlinked cwd selected as the repository is one root for revie
   const linked = path.join(workRoot, `${path.basename(real)}-link`)
   fs.symlinkSync(real, linked)
   t.after(() => fs.rmSync(linked, { force: true }))
+  t.after(() => fs.rmSync(real, { recursive: true, force: true }))
   fs.writeFileSync(path.join(real, 'a.js'), 'export const a = 1\n')
   const svc = service()
   t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
@@ -629,22 +630,25 @@ test('T1 a group in a symlinked-cwd root reaches the canonical filed paths', asy
   const linked = path.join(workRoot, `${path.basename(real)}-link`)
   fs.symlinkSync(real, linked)
   t.after(() => fs.rmSync(linked, { force: true }))
+  t.after(() => fs.rmSync(real, { recursive: true, force: true }))
   fs.writeFileSync(path.join(real, 'a.js'), 'export const a = 1\n')
   fs.writeFileSync(path.join(real, 'b.js'), 'export const b = 1\n')
+  fs.mkdirSync(path.join(real, 'dir'))
+  fs.writeFileSync(path.join(real, 'dir', 'c.js'), 'export const c = 1\n')
   const svc = service()
   t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
   const parent = parentOf(linked)
-  announceParentTurn(svc, parent, 1, [file('a.js'), file('b.js')], linked)
+  announceParentTurn(svc, parent, 1, [file('a.js'), file('b.js'), file('dir/c.js')], linked)
   const agent = agentFor(linked, parent.id)
   const before = await svc.repositoryReport(agent)
   const filed = before.repositories.flatMap(r => r.files).map(f => f.absolute).sort()
-  assert.deepEqual(filed, [path.join(real, 'a.js'), path.join(real, 'b.js')], 'precondition: files are filed under canonical paths in the linked root')
+  assert.deepEqual(filed, [path.join(real, 'a.js'), path.join(real, 'b.js'), path.join(real, 'dir', 'c.js')].sort(), 'precondition: files are filed under canonical paths in the linked root')
   await svc.attest(agent, {
     action: 'attest', repository_root: linked,
-    claims: [{ path: 'a*', decision: 'mine' }],
-    reviewed_code_files: ['a*'],
-    adopted_files: ['a*'],
-    demonstrated_files: [{ path: 'a*', note: 'ran the fixture' }],
+    claims: [{ path: 'a*', decision: 'mine' }, { path: 'dir/', decision: 'mine' }],
+    reviewed_code_files: ['a*', 'dir/'],
+    adopted_files: ['a*', 'dir/'],
+    demonstrated_files: [{ path: 'a*', note: 'ran the fixture' }, { path: 'dir/', note: 'ran the fixture' }],
     items: [],
   })
   const entries = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files)
@@ -655,6 +659,12 @@ test('T1 a group in a symlinked-cwd root reaches the canonical filed paths', asy
   assert.ok(a.demonstrated, 'the group demonstration reaches the canonical a.js')
   const b = entries.find(f => f.absolute === path.join(real, 'b.js'))
   assert.equal(b.claim, 'unclaimed', 'a path outside the group is untouched')
+  const c = entries.find(f => f.absolute === path.join(real, 'dir', 'c.js'))
+  assert.ok(c, 'the real subdirectory is filed under its canonical path')
+  assert.equal(c.claim, 'mine', 'the prefix claim reaches the canonical dir/c.js')
+  assert.equal(c.reviewed, true, 'the prefix review reaches the canonical dir/c.js')
+  assert.equal(c.adopted, true, 'the prefix adoption reaches the canonical dir/c.js')
+  assert.ok(c.demonstrated, 'the prefix demonstration reaches the canonical dir/c.js')
 })
 
 // T1: universal path grouping. A group value is one bare string and its form is decided by the
@@ -715,6 +725,7 @@ test('T1 exact, prefix, and pattern forms share one grammar across all three pat
   // all three arguments, and the prefix must reach the applied state for every named path.
   await svc.attest(agent, {
     action: 'attest', repository_root: repo,
+    claims: [{ path: 'lib/', decision: 'mine' }],
     reviewed_code_files: ['lib/'],
     adopted_files: ['lib/'],
     demonstrated_files: [{ path: 'lib/', note: 'ran the fixture' }],
@@ -724,12 +735,16 @@ test('T1 exact, prefix, and pattern forms share one grammar across all three pat
   for (const name of ['lib/one.js', 'lib/two.js']) {
     const entry = files.find(f => f.absolute === path.join(repo, name))
     assert.ok(entry, `${name} is filed`)
+    assert.equal(entry.claim, 'mine', `${name} is claimed mine by the prefix group`)
     assert.equal(entry.reviewed, true, `${name} is reviewed by the prefix group`)
     assert.equal(entry.adopted, true, `${name} is adopted by the prefix group`)
     assert.ok(entry.demonstrated, `${name} is demonstrated by the prefix group`)
   }
+  assert.ok(!files.some(f => f.absolute === path.join(repo, 'lib')), 'the directory itself is not filed as a changed file')
   const outside = files.find(f => f.absolute === path.join(repo, 'app.js.map'))
   assert.equal(outside.adopted, false, 'a path outside the prefix is not adopted by it')
+  assert.equal(outside.reviewed, false, 'a path outside the prefix is not reviewed by it')
+  assert.equal(outside.demonstrated, null, 'a path outside the prefix is not demonstrated by it')
 })
 
 // T1 (OCR-CODE-T1-R1-2): a trailing backslash is a declared prefix spelling, so on POSIX
@@ -764,6 +779,8 @@ test('T1 a trailing-backslash prefix reaches the same filed paths as a slash pre
   }
   const sibling = files.find(f => f.absolute === path.join(repo, 'library.js'))
   assert.equal(sibling.adopted, false, 'a directory prefix does not reach a sibling')
+  assert.equal(sibling.reviewed, false, 'a directory prefix does not review a sibling')
+  assert.equal(sibling.demonstrated, null, 'a directory prefix does not demonstrate a sibling')
 })
 
 test('T1 a grouped claim carries its own mine decision and applies it to every named path', async t => {
