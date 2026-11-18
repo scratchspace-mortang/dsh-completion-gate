@@ -448,3 +448,74 @@ test('T1 overlap is checked within one path argument, not across arguments', asy
   assert.equal(entry.claim, 'mine', 'the claim across arguments was applied')
   assert.equal(entry.adopted, true, 'the adoption across arguments was applied')
 })
+
+// T1 (OCR-CODE-T1-R1-5): two identical exact values in reviewed_code_files or adopted_files
+// are permitted by the schema and were accepted before grouping. They resolve idempotently
+// to one filed path and must not be refused as an ambiguous overlap of a path with itself.
+test('duplicate exact reviewed and adopted entries stay accepted', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'ab.js'), 'export const ab = 1\n')
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('ab.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const done = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'ab.js', decision: 'mine' }],
+    reviewed_code_files: ['ab.js', 'ab.js'],
+    adopted_files: ['ab.js', 'ab.js'],
+    demonstrated_files: [{ path: 'ab.js', note: 'ran the fixture' }],
+    items: [],
+    summary: 'Duplicate exact evidence values are idempotent.',
+  })
+  assert.equal(done.pass, true, `duplicate exact evidence stays accepted: ${JSON.stringify(done.blockers)}`)
+  const entry = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, 'ab.js'))
+  assert.equal(entry.reviewed, true, 'the duplicated review applied')
+  assert.equal(entry.adopted, true, 'the duplicated adoption applied')
+})
+
+// T1 (OCR-CODE-T1-R1-6): a group naming no filed path gets its own next action. A group claim
+// is skipped by the claim route, but an exact claim of the concrete path would file it, so the
+// refusal must name that action instead of claiming no action helps (or that adding the group
+// to claims files it).
+test('a group naming no filed path names the exact claim that files the concrete file', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'concrete.js'), 'export const concrete = 1\n')
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  parentIdleTurn(svc, parent, 1)
+  const agent = agentFor(repo, parent.id)
+
+  const claimRefusal = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'concrete*', decision: 'mine' }],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(claimRefusal, 'a group claim naming no filed path must refuse')
+  const claimMessage = claimRefusal.errors?.join('\n') ?? claimRefusal.message
+  assert.match(claimMessage, /names no filed changed file/, 'the refusal names the condition')
+  assert.match(claimMessage, /exact value|exact claim|exact path/i, 'the claim refusal names the exact-claim next action')
+  assert.doesNotMatch(claimMessage, /no action on this path helps/, 'the claim refusal does not say nothing helps')
+
+  const reviewRefusal = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    reviewed_code_files: ['concrete*'],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(reviewRefusal, 'a group review naming no filed path must refuse')
+  const reviewMessage = reviewRefusal.errors?.join('\n') ?? reviewRefusal.message
+  assert.match(reviewMessage, /exact value|exact claim|exact path/i, 'the non-claim refusal also names the exact-claim next action')
+  assert.doesNotMatch(reviewMessage, /a claim is the route that files it/, 'the non-claim refusal does not promise the group claim files it')
+
+  const accepted = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'concrete.js', decision: 'mine' }],
+    reviewed_code_files: ['concrete.js'],
+    demonstrated_files: [{ path: 'concrete.js', note: 'ran the fixture' }],
+    items: [],
+    summary: 'The concrete exact claim files the path.',
+  })
+  assert.equal(accepted.pass, true, `an exact claim of the concrete path files it: ${JSON.stringify(accepted.blockers)}`)
+})
