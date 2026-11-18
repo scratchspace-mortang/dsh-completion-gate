@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CompletionGateService } from '../lib/index.js'
+import { attestSchemaErrors } from '../lib/tracker.js'
 import { contentKey, isDocumentationPath } from '../lib/changes.js'
 import { userMessage } from './user-message.mjs'
 
@@ -763,4 +764,148 @@ test('a subagent session is reported as not covered by the host change recorder'
     const status = await svc.statusResult(agent)
     assert.match(status.markdown, /Notice: The host change recorder does not record this session, so the files turn 1 changed cannot be determined\./)
   } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+// T2: a repository whose history gives each filed path a distinct last-change state relative to one
+// named commit. `old.js` was last changed strictly before it, `at.js` by the commit itself, and
+// `dirty.js` carries an uncommitted change on top of a last commit that is strictly before it.
+function historyRepo(t) {
+  const repo = tempRepo(t)
+  fs.writeFileSync(path.join(repo, 'old.js'), 'const old = 1\n')
+  fs.writeFileSync(path.join(repo, 'dirty.js'), 'const dirty = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'old work'])
+  fs.writeFileSync(path.join(repo, 'at.js'), 'const at = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'new work'])
+  const before = git(repo, ['rev-parse', 'HEAD']).trim()
+  fs.writeFileSync(path.join(repo, 'dirty.js'), 'const dirty = 2\n')
+  return { repo, before }
+}
+
+// File the three paths and give each an initial `mine` claim, so a later batch can be judged by
+// what it changes (or keeps) rather than by filling an unclaimed ledger.
+async function fileAndClaimMine(svc, agent, repo) {
+  announce(svc, 'session-1', 1, 500, [file('old.js'), file('at.js'), file('dirty.js')], repo)
+  return svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: ['old.js', 'at.js', 'dirty.js'].map(p => ({ path: p, decision: 'mine' })),
+  })
+}
+
+function claimByPath(svc, agent) {
+  const snapshot = svc.repositories.repositories(agent.id)
+  return Object.fromEntries(snapshot[0].files.map(f => [path.basename(f.path), f.claim]))
+}
+
+function toolService() {
+  fs.mkdirSync(workRoot, { recursive: true })
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'cg-gate-tool-')))
+  let registered = null
+  const ctx = {
+    reflect: { get: () => null },
+    on: () => () => {},
+    provide: () => () => {},
+    tools: { register: definition => { registered = definition; return () => {} } },
+    commands: { register: () => () => {} },
+    systemPrompt: { section: () => () => {} },
+    webServer: { register: () => () => {} },
+  }
+  const instance = new CompletionGateService(ctx, {}, { settingsPath: path.join(dir, 'settings.json') })
+  instance.start()
+  return { instance, registered, dir }
+}
+
+test('T2 before_commit clears a path last changed strictly before the named commit', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ before_commit: before, decision: 'not-mine' }] })
+    assert.equal(claimByPath(svc, agent)['old.js'], 'not-mine', 'a path last changed strictly before the commit is cleared')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit keeps a path the named commit itself changed', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ before_commit: before, decision: 'not-mine' }] })
+    assert.equal(claimByPath(svc, agent)['at.js'], 'mine', 'the commit\'s own change keeps its claim under a strict since boundary')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit keeps a path with an uncommitted change', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ before_commit: before, decision: 'not-mine' }] })
+    assert.equal(claimByPath(svc, agent)['dirty.js'], 'mine', 'a path with an uncommitted change keeps its claim and ledger place')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit refuses an unresolvable commit name by name', async t => {
+  const { repo } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    await assert.rejects(
+      svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ before_commit: 'no-such-commit-xyz', decision: 'not-mine' }] }),
+      /no-such-commit-xyz/,
+      'the refusal names the commit input',
+    )
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit refuses an unreadable history naming the repository', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    fs.writeFileSync(path.join(repo, '.git', 'HEAD'), 'ref: refs/heads/missing-for-test\n')
+    let message = ''
+    try {
+      await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ before_commit: before, decision: 'not-mine' }] })
+    } catch (error) { message = error.message }
+    assert.ok(message.includes(repo), `the refusal must name the repository ${repo}, got: ${message}`)
+    assert.match(message, /history/i, 'the refusal says the history could not be read')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 a refused before_commit batch writes nothing', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    let refused = ''
+    try {
+      await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [
+        { before_commit: before, decision: 'not-mine' },
+        { before_commit: 'no-such-commit-xyz', decision: 'not-mine' },
+      ] })
+    } catch (error) { refused = error.message }
+    assert.equal(claimByPath(svc, agent)['old.js'], 'mine', 'the valid entry in a refused batch writes no clearing')
+    assert.match(refused, /no-such-commit-xyz/, 'the second entry refuses the batch by name')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 a before_commit decision other than not-mine is refused with the value named', t => {
+  const errors = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ before_commit: 'abc123', decision: 'mine' }] })
+  assert.ok(errors.some(error => error.includes('mine')), `the validator must name the decision value: ${errors.join('; ')}`)
+  assert.deepEqual(attestSchemaErrors({ repository_root: process.cwd(), claims: [{ before_commit: 'abc123', decision: 'not-mine' }] }), [], 'a not-mine batch entry is valid')
+  const { instance, registered, dir } = toolService()
+  try {
+    const oneOf = registered.parameters.properties.claims.items.oneOf
+    const batch = oneOf.find(variant => variant.properties?.before_commit)
+    assert.ok(batch, 'the tool schema publishes a before_commit claims branch')
+    assert.deepEqual(batch.properties.decision.enum ?? [batch.properties.decision.const], ['not-mine'], 'the tool schema constrains a before_commit decision to not-mine')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
