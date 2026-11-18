@@ -374,3 +374,77 @@ test('an ownerless file names the fallback cwd instead of promising the claim ro
   const report = await svc.repositoryReport(agent)
   assert.ok(report.repositories.some(r => r.root === cwdRepo && r.files.some(f => f.absolute === ownerless && f.claim === 'mine')), 'the ownerless file files under the fallback cwd')
 })
+
+// T1 overlap refusal: within one path argument, a group and an exact entry (or two groups)
+// that name the same filed path are ambiguous. The refusal names that absolute path and the
+// whole call writes nothing. Overlap is checked per argument, never across arguments.
+
+test('T1 a group and an exact entry naming one filed path are refused by name with nothing written', async t => {
+  const repo = tempRepo()
+  for (const name of ['ab.js', 'abc.js']) fs.writeFileSync(path.join(repo, name), `export const ${name} = 1\n`)
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('ab.js'), file('abc.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const shared = path.join(repo, 'ab.js')
+  const error = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'ab*', decision: 'not-mine' }, { path: 'ab.js', decision: 'not-mine' }],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(error, 'a group and an exact entry over one path must refuse')
+  const message = error.errors?.join('\n') ?? error.message
+  assert.ok(message.includes(shared), `the refusal names the overlapping path ${shared}: ${message}`)
+  assert.match(message, /named by both|ambiguous/i, 'the refusal names the overlap, not an unfiled path')
+  const files = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files)
+  assert.deepEqual(files.map(f => f.claim), ['unclaimed', 'unclaimed'], 'nothing was written to the ledger')
+})
+
+test('T1 two groups naming one filed path are refused by name with nothing written', async t => {
+  const repo = tempRepo()
+  for (const name of ['ab.js', 'abc.js']) fs.writeFileSync(path.join(repo, name), `export const ${name} = 1\n`)
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('ab.js'), file('abc.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const shared = path.join(repo, 'abc.js')
+  const error = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'ab*', decision: 'not-mine' }, { path: 'abc*', decision: 'not-mine' }],
+    items: [],
+  }).then(() => null, e => e)
+  assert.ok(error, 'two groups over one path must refuse')
+  const message = error.errors?.join('\n') ?? error.message
+  assert.ok(message.includes(shared), `the refusal names the overlapping path ${shared}: ${message}`)
+  assert.match(message, /named by both|ambiguous/i, 'the refusal names the overlap')
+  const files = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files)
+  assert.deepEqual(files.map(f => f.claim), ['unclaimed', 'unclaimed'], 'nothing was written to the ledger')
+})
+
+test('T1 overlap is checked within one path argument, not across arguments', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'ab.js'), 'export const ab = 1\n')
+  const svc = service()
+  t.after(() => cleanupService(svc))
+  const parent = parentOf(repo)
+  const child = childOf(repo, parent.id, 'child-1', 1)
+  parentIdleTurn(svc, parent, 1)
+  writerTurn(svc, child, 1, 'ab.js')
+  const agent = agentFor(repo, parent.id)
+  // The same group names ab.js in claims and in adopted_files. That is two arguments, so it is
+  // not an overlap. A mutant that pools the arguments would refuse this call.
+  const done = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'ab*', decision: 'mine' }],
+    adopted_files: ['ab*'],
+    reviewed_code_files: ['ab*'],
+    demonstrated_files: [{ path: 'ab*', note: 'ran the fixture' }],
+    items: [],
+  })
+  assert.equal(done.pass, true, `the same group across arguments is not an overlap: ${done.markdown}`)
+  const entry = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, 'ab.js'))
+  assert.equal(entry.claim, 'mine', 'the claim across arguments was applied')
+  assert.equal(entry.adopted, true, 'the adoption across arguments was applied')
+})

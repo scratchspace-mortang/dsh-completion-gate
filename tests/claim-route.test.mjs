@@ -619,3 +619,117 @@ test('regression: symlinked cwd selected as the repository is one root for revie
   const report = await svc.repositoryReport(agent)
   assert.ok(report.repositories.some(r => r.root === linked && r.files.some(f => f.absolute === path.join(real, 'a.js') && f.claim === 'mine')), 'the claim files under the symlinked cwd root')
 })
+
+// T1: universal path grouping. A group value is one bare string and its form is decided by the
+// string alone: a trailing `*` is a pattern (paths starting with the stem), a trailing path
+// separator is a prefix (paths starting with it), and any other value is exact (the one path it
+// resolves to). Several paths are several entries; there is no fourth list shape. A filed path
+// that is also a string prefix of another filed path is named only by the exact form, so the
+// bare string never silently widens to its prefix match.
+
+test('T1 group claim expands a trailing-star pattern over filed paths', async t => {
+  const repo = tempRepo()
+  for (const name of ['ab.js', 'abc.js', 'other.js']) fs.writeFileSync(path.join(repo, name), `export const ${name} = 1\n`)
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('ab.js'), file('abc.js'), file('other.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const before = await svc.repositoryReport(agent)
+  assert.deepEqual(filesOf(before), ['ab.js', 'abc.js', 'other.js'].map(n => path.join(repo, n)), 'precondition: all three paths are filed')
+  await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'ab*', decision: 'not-mine' }],
+    items: [],
+  })
+  const report = await svc.repositoryReport(agent)
+  const claimOf = name => report.repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, name)).claim
+  assert.equal(claimOf('ab.js'), 'not-mine', 'ab.js is cleared by the pattern')
+  assert.equal(claimOf('abc.js'), 'not-mine', 'abc.js is cleared by the pattern')
+  assert.equal(claimOf('other.js'), 'unclaimed', 'a filed path outside the pattern is untouched')
+})
+
+test('T1 exact, prefix, and pattern forms share one grammar across all three path arguments', async t => {
+  const repo = tempRepo()
+  for (const name of ['app.js', 'app.js.map', 'lib/one.js', 'lib/two.js']) {
+    const target = path.join(repo, name)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, `export const ${name} = 1\n`)
+  }
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('app.js'), file('app.js.map'), file('lib/one.js'), file('lib/two.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const claimOf = async name => (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files).find(f => f.absolute === path.join(repo, name)).claim
+
+  // `app.js` is both a filed path and a string prefix of `app.js.map`. The bare value is exact,
+  // so it names only itself; this is the discriminator between the exact and prefix forms.
+  await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ path: 'app.js', decision: 'not-mine' }], items: [] })
+  assert.equal(await claimOf('app.js'), 'not-mine', 'the exact form names the filed path')
+  assert.equal(await claimOf('app.js.map'), 'unclaimed', 'the exact form does not widen to a path it prefixes')
+
+  // A trailing-star pattern names every filed path starting with its stem, including the exact path.
+  await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ path: 'app.js*', decision: 'not-mine' }], items: [] })
+  assert.equal(await claimOf('app.js.map'), 'not-mine', 'the pattern reaches the path the exact form could not')
+
+  // A trailing-separator prefix names every filed path under it. The same form works in
+  // adopted_files and demonstrated_files, so one rule is learned for all three arguments.
+  const done = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    adopted_files: ['lib/'],
+    demonstrated_files: [{ path: 'lib/', note: 'ran the fixture' }],
+    items: [],
+  })
+  assert.ok(done, 'a prefix group is accepted in adopted_files and demonstrated_files')
+})
+
+test('T1 a grouped claim carries its own mine decision and applies it to every named path', async t => {
+  const repo = tempRepo()
+  for (const name of ['ab.js', 'abc.js', 'other.js']) fs.writeFileSync(path.join(repo, name), `export const ${name} = 1\n`)
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  const child = childOf(repo, parent.id, 'child-1', 1)
+  writerTurn(svc, child, 1, 'ab.js')
+  announceParentTurn(svc, parent, 2, [file('abc.js'), file('other.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  const done = await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'ab*', decision: 'mine' }],
+    adopted_files: ['ab*'],
+    reviewed_code_files: ['ab*'],
+    demonstrated_files: [{ path: 'ab*', note: 'ran the fixture' }],
+    items: [],
+  })
+  assert.ok(!done.blockers.some(blocker => /ab\.js|abc\.js/.test(blocker)), `the grouped paths owe nothing: ${done.markdown}`)
+  const files = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files)
+  const of = name => files.find(f => f.absolute === path.join(repo, name))
+  for (const name of ['ab.js', 'abc.js']) {
+    const entry = of(name)
+    assert.equal(entry.claim, 'mine', `${name} is claimed mine by the grouped decision`)
+    assert.equal(entry.reviewed, true, `${name} is reviewed by the group`)
+    assert.ok(entry.demonstrated, `${name} is demonstrated by the group`)
+  }
+  assert.equal(of('ab.js').adopted, true, 'the grouped adoption covers the child-written path')
+  assert.equal(of('other.js').claim, 'unclaimed', 'a path outside the group is untouched')
+})
+
+test('T1 a non-overlapping group and exact entry in claims are both applied', async t => {
+  const repo = tempRepo()
+  for (const name of ['ab.js', 'abc.js', 'a.js']) fs.writeFileSync(path.join(repo, name), `export const ${name} = 1\n`)
+  const svc = service()
+  t.after(() => fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }))
+  const parent = parentOf(repo)
+  announceParentTurn(svc, parent, 1, [file('ab.js'), file('abc.js'), file('a.js')], repo)
+  const agent = agentFor(repo, parent.id)
+  await svc.attest(agent, {
+    action: 'attest', repository_root: repo,
+    claims: [{ path: 'ab*', decision: 'not-mine' }, { path: 'a.js', decision: 'not-mine' }],
+    items: [],
+  })
+  const files = (await svc.repositoryReport(agent)).repositories.flatMap(r => r.files)
+  for (const name of ['ab.js', 'abc.js', 'a.js']) {
+    assert.equal(files.find(f => f.absolute === path.join(repo, name)).claim, 'not-mine', `${name} is cleared by its entry`)
+  }
+})
