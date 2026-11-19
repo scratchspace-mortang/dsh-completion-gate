@@ -210,6 +210,65 @@ test('T5 excludeCatalog ignores both catalogs under a directory named [id]', asy
   assert.ok(lines.includes('\\[id\\]/.dsh/verification.json'), `the bracket is escaped in the exclude file: ${lines.join('|')}`)
 })
 
+test('T5 excludeCatalog removes a stale unescaped catalog line left by an earlier build', async t => {
+  const repo = gitRepo('bracket-stale-')
+  const nested = path.join(repo, '[id]')
+  fs.mkdirSync(nested)
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  fs.writeFileSync(exclude, '# keep me\n*.log\n[id]/.dsh/verification.json\n[id]/.dsh/verification-archive.json\n')
+  const result = await excludeCatalog(nested)
+  assert.equal(result.applied, true, 'the rewrite is applied')
+  const lines = excludeLines(repo)
+  assert.equal(lines.includes('[id]/.dsh/verification.json'), false, 'the stale raw catalog line is gone')
+  assert.equal(lines.includes('[id]/.dsh/verification-archive.json'), false, 'the stale raw archive line is gone')
+  assert.ok(lines.includes('\\[id\\]/.dsh/verification.json'), `the escaped catalog line is written: ${lines.join('|')}`)
+  assert.ok(lines.includes('\\[id\\]/.dsh/verification-archive.json'), 'the escaped archive line is written')
+  assert.ok(lines.includes('# keep me'), 'the unrelated comment survives byte-for-byte')
+  assert.ok(lines.includes('*.log'), 'the unrelated log rule survives byte-for-byte')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', 'i/.dsh/verification.json'], { cwd: repo }).status, 1, 'the unrelated i/ path is visible again')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', 'd/.dsh/verification.json'], { cwd: repo }).status, 1, 'the unrelated d/ path is visible again')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', '[id]/.dsh/verification.json'], { cwd: repo }).status, 0, 'the real catalog stays hidden')
+})
+
+// One companion test per escape token, so a one-token edit to escapeGitPattern fails the test that owns that token rather
+// than leaving the suite green. Each asserts git ignores both catalogs and the exact escaped line is on disk.
+for (const { rootName, escaped } of [
+  { rootName: '!important', escaped: '\\!important' },
+  { rootName: 'a*b', escaped: 'a\\*b' },
+  { rootName: 'a?b', escaped: 'a\\?b' },
+  { rootName: 'a\\b', escaped: 'a\\\\b' },
+]) {
+  test(`T5 excludeCatalog ignores both catalogs under a directory named ${rootName}`, async t => {
+    const repo = gitRepo('escape-token-')
+    const nested = path.join(repo, rootName)
+    fs.mkdirSync(nested)
+    const result = await excludeCatalog(nested)
+    assert.equal(result.applied, true, 'the nested root is inside the repository')
+    for (const file of [`${rootName}/.dsh/verification.json`, `${rootName}/.dsh/verification-archive.json`]) {
+      assert.equal(spawnSync('git', ['check-ignore', '-q', '--', file], { cwd: repo }).status, 0, `git ignores ${file} as a literal path`)
+    }
+    const lines = excludeLines(repo)
+    assert.ok(lines.includes(`${escaped}/.dsh/verification.json`), `the catalog line is escaped on disk: ${lines.join('|')}`)
+    assert.ok(lines.includes(`${escaped}/.dsh/verification-archive.json`), `the archive line is escaped on disk: ${lines.join('|')}`)
+  })
+}
+
+test('T5 a private exclude file keeps its mode and rules across a register', async t => {
+  const repo = gitRepo('exclude-mode-')
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  fs.writeFileSync(exclude, '# keep me\n*.log\n')
+  fs.chmodSync(exclude, 0o600)
+  const result = await registerItems(repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+  assert.equal(result.exclusion.applied, true, 'the exclusion is applied')
+  assert.equal((fs.statSync(exclude).mode & 0o7777).toString(8), '600', 'the deliberate private mode survives the atomic rewrite')
+  const after = fs.readFileSync(exclude, 'utf8')
+  assert.ok(after.includes('# keep me'), 'the unrelated comment survives byte-for-byte')
+  assert.ok(after.includes('*.log'), 'the unrelated log rule survives byte-for-byte')
+  assert.ok(after.includes('.dsh/verification.json'), 'the catalog line is written')
+  assert.ok(after.includes('.dsh/verification-archive.json'), 'the archive line is written')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', 'probe.log'], { cwd: repo }).status, 0, 'the surviving *.log rule still ignores')
+})
+
 test('T5 excludeCatalog refuses a root whose catalog path would carry a newline', async t => {
   const repo = gitRepo('newline-root-')
   const nested = path.join(repo, 'line\nbreak')
