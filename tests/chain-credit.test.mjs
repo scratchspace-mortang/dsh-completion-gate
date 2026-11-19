@@ -5,7 +5,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CompletionGateService } from '../lib/index.js'
-import { adoptionCovers, attestSchemaErrors } from '../lib/tracker.js'
+import { adoptionCovers, attestSchemaErrors, evaluateRepository } from '../lib/tracker.js'
+import { readCatalog } from '../lib/catalog.js'
 import { userMessage } from './user-message.mjs'
 
 // Chain credit (ticket x9qb): a dispatched child writer's write/edit call files
@@ -1010,4 +1011,83 @@ test('T3 wrong-type adoptedChildIds values are refused cleanly', () => {
   assert.ok(notArray.some(error => error.includes('adoptedChildIds must be an array of non-empty child session ids.')), `a non-array value must be refused: ${notArray.join('; ')}`)
   const notString = attestSchemaErrors({ repository_root: process.cwd(), adoptedChildIds: [123] })
   assert.ok(notString.some(error => error.includes('adoptedChildIds must be an array of non-empty child session ids.')), `a non-string entry must be refused: ${notString.join('; ')}`)
+})
+
+// OCR-3 round 2: the status report's unadopted problem is model-facing text too.
+// It must name both recorded routes, so a model reading status is not steered
+// back to per-path adoption. This calls the evaluator directly on the state it
+// prints: a child-written file claimed mine whose provenance is not adopted.
+test('T3 an unadopted status problem names both adoption routes', () => {
+  const repo = tempRepo()
+  const absolute = path.join(repo, 'shared.js')
+  const snapshot = {
+    root: repo, label: 'repo', catalogPath: path.join(repo, '.dsh', 'verification.json'),
+    files: [{
+      path: 'shared.js', absolute, claim: 'mine', writerId: 'child-1',
+      documentation: false, reviewed: false, demonstrated: false,
+      provenance: ['child-1#1'], adoptedFor: [], adopted: false, key: 'child-key',
+    }],
+    itemStates: [],
+    attestation: { digest: 'digest', summary: '', createdAt: 0 }, introduced: false, stale: false,
+  }
+  const evaluated = evaluateRepository(snapshot, readCatalog(repo))
+  const problem = evaluated.problems.find(text => text.includes('not adopted'))
+  assert.ok(problem, `the report names the unadopted file: ${evaluated.problems.join(' | ')}`)
+  assert.match(problem, /adopted_files/, `the status problem names adopted_files: ${problem}`)
+  assert.match(problem, /adoptedChildIds/, `the status problem names adoptedChildIds: ${problem}`)
+})
+
+// OCR-3 round 2: the docs_checked adoption refusal must name both routes on its
+// own clause, not just on the sibling claiming-it-mine clause in the same refusal.
+// The clause is isolated by line so a mutant that touches only the docs site dies
+// here even while the shared-constant test stays green.
+test('T3 a docs_checked adoption refusal names both adoption routes', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'doc.md'), '# Doc\n')
+  writeUnitCatalog(repo)
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const writer = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, writer, 1, 'doc.md')
+    const agent = agentFor(repo, parent.id)
+    const args = {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'doc.md', decision: 'mine' }],
+      docs_checked: true,
+      demonstrated_files: [{ path: 'doc.md', note: 'read the doc' }],
+      items: [{ id: 'unit', state: 'passed' }], summary: 'Cover the child doc write.',
+    }
+    let message = ''
+    try { await svc.attest(agent, args) } catch (error) { message = error.message }
+    const clause = message.split('\n').find(line => line.includes('covering it with docs_checked'))
+    assert.ok(clause, `the refusal names the docs_checked route: ${message}`)
+    assert.match(clause, /adopted_files/, `the docs_checked clause names adopted_files: ${clause}`)
+    assert.match(clause, /adoptedChildIds/, `the docs_checked clause names adoptedChildIds: ${clause}`)
+    const accepted = await svc.attest(agent, { ...args, adopted_files: ['doc.md'] })
+    assert.equal(accepted.pass, true, `adopting the doc writer explicitly passes: ${JSON.stringify(accepted.blockers)}`)
+  })
+})
+
+// OCR-4 round 2, mirrored direction: exact writer-id equality in both prefix
+// directions. The shorter writer child-1 must not be adopted by naming a longer
+// child id child-10, even though 'child-10' starts with 'child-1'. Naming the
+// exact writer must still adopt it.
+test('T3 a shorter writer id is not adopted by naming a longer child id', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'shared.js'), 'const shared = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const writer = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, writer, 1, 'shared.js')
+    const agent = agentFor(repo, parent.id)
+    const args = adoptArgs(['shared.js'], repo, { adoptedChildIds: ['child-10'] })
+    let message = ''
+    try { await svc.attest(agent, args) } catch (error) { message = error.message }
+    assert.match(message, /adopt/i, `naming child-10 must refuse writer child-1: ${message}`)
+    assert.match(message, /child-1/, `the refusal names the uncovered writer: ${message}`)
+    const accepted = await svc.attest(agent, { ...args, adoptedChildIds: ['child-1'] })
+    assert.equal(accepted.pass, true, `naming the exact writer adopts it: ${JSON.stringify(accepted.blockers)}`)
+  })
 })
