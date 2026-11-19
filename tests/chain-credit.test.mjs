@@ -736,6 +736,7 @@ function capturedService() {
   const off = () => () => {}
   let tool = null
   let prompt = null
+  fs.mkdirSync(workRoot, { recursive: true })
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'cg-t3-capture-')))
   const ctx = {
     reflect: { get: () => undefined },
@@ -905,11 +906,108 @@ test('T3 adoptedChildIds is a published attest argument with matching schema and
     const prop = svc.__tool().parameters.properties.adoptedChildIds
     assert.ok(prop, 'the tool schema publishes adoptedChildIds')
     assert.equal(prop.type, 'array', 'the property is an array of session ids')
+    assert.equal(prop.items.type, 'string', 'the published item requires a string id')
+    assert.equal(prop.items.minLength, 1, 'the published item requires a non-empty id')
     assert.equal(prop.items.pattern, '\\S', 'the property refuses whitespace-only ids')
     assert.match(prop.description, /any turn|every turn/, 'the property says naming a child covers every turn')
     assert.match(prop.description, /another session.*adoption/i, 'the property keeps the other-session rule')
     const prompt = svc.__prompt().text
     assert.match(prompt, /adoptedChildIds/, 'the system-prompt adoption paragraph names adoptedChildIds')
     assert.match(prompt, /any turn|every turn/, 'the system prompt states the same all-turn rule')
+    assert.doesNotMatch(prompt, /only by listing it in adopted_files/, 'the prompt does not present adopted_files as the only route')
+    assert.match(prompt, /either listing it in adopted_files/, 'the prompt states that either route claims a child-written file')
+    assert.match(prompt, /needs the adoption of that session/, 'the prompt keeps the other-session adoption clause')
+    assert.match(prompt, /not-mine rejection never adopts/, 'the prompt keeps the not-mine clause')
   })
+})
+
+// OCR-1: the application side records only the named child's provenance on a
+// shared path. The other writer's bytes stay uncovered for a later mine claim.
+test('T3 naming one child records only that child provenance on a shared path', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'own.js'), 'const own = 1\n')
+  fs.writeFileSync(path.join(repo, 'shared.js'), 'const shared = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const named = childOf(repo, parent.id, 'child-1', 1)
+    const other = childOf(repo, parent.id, 'child-2', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, named, 1, 'own.js')
+    writerTurn(svc, named, 1, 'shared.js')
+    writerTurn(svc, other, 1, 'shared.js')
+    const agent = agentFor(repo, parent.id)
+    await svc.attest(agent, adoptArgs(['own.js'], repo, { adoptedChildIds: ['child-1'] }))
+    const files = adoptedFilesOf(await svc.repositoryReport(agent))
+    assert.deepEqual(files.get('shared.js').adoptedFor, ['child-1#1'], 'only the named child provenance is recorded')
+    await assert.rejects(svc.attest(agent, adoptArgs(['shared.js'], repo)), /adopt/i, 'the second writer still needs its own adoption')
+  })
+})
+
+// OCR-4: writer-id equality, not a prefix match. child-10 must not be adopted
+// by naming child-1, and the refusal must name the child-10 provenance.
+test('T3 a prefix-sharing child id is not adopted by naming a shorter child id', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'shared.js'), 'const shared = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const named = childOf(repo, parent.id, 'child-1', 1)
+    const other = childOf(repo, parent.id, 'child-10', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, named, 1, 'shared.js')
+    writerTurn(svc, other, 1, 'shared.js')
+    const agent = agentFor(repo, parent.id)
+    const args = adoptArgs(['shared.js'], repo, { adoptedChildIds: ['child-1'] })
+    let message = ''
+    try { await svc.attest(agent, args) } catch (error) { message = error.message }
+    assert.match(message, /adopt/i, `naming child-1 must refuse child-10: ${message}`)
+    assert.match(message, /child-10/, `the refusal names the other writer: ${message}`)
+  })
+})
+
+// OCR-2: the writer id is everything before the last '#'. A writer id that
+// contains '#' is matched only by its exact name, not by its leading segment.
+test('T3 a writer id containing a hash is parsed before the last hash', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'hash.js'), 'const hash = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const writer = childOf(repo, parent.id, 'a#b', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, writer, 1, 'hash.js')
+    const agent = agentFor(repo, parent.id)
+    const args = adoptArgs(['hash.js'], repo)
+    await assert.rejects(svc.attest(agent, { ...args, adoptedChildIds: ['a'] }), /adopt/i, 'naming a must not adopt writer a#b')
+    const accepted = await svc.attest(agent, { ...args, adoptedChildIds: ['a#b'] })
+    assert.equal(accepted.pass, true, `naming the exact writer adopts it: ${JSON.stringify(accepted.blockers)}`)
+    const files = adoptedFilesOf(await svc.repositoryReport(agent))
+    assert.ok(files.get('hash.js').adoptedFor.includes('a#b#1'), 'the exact writer provenance is recorded')
+  })
+})
+
+// OCR-3: every adoption refusal names both recorded routes, so a model that
+// named a child which did not cover the path is told about the other route.
+test('T3 an adoption refusal names both adopted_files and adoptedChildIds', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'shared.js'), 'const shared = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const named = childOf(repo, parent.id, 'child-1', 1)
+    const other = childOf(repo, parent.id, 'child-2', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, named, 1, 'shared.js')
+    writerTurn(svc, other, 1, 'shared.js')
+    const agent = agentFor(repo, parent.id)
+    let message = ''
+    try { await svc.attest(agent, adoptArgs(['shared.js'], repo, { adoptedChildIds: ['child-1'] })) } catch (error) { message = error.message }
+    assert.match(message, /adopted_files/, `the refusal names adopted_files: ${message}`)
+    assert.match(message, /adoptedChildIds/, `the refusal names adoptedChildIds: ${message}`)
+  })
+})
+
+// OCR-9: wrong-typed adoptedChildIds values are clean refusals, not a throw.
+test('T3 wrong-type adoptedChildIds values are refused cleanly', () => {
+  const notArray = attestSchemaErrors({ repository_root: process.cwd(), adoptedChildIds: 'child-1' })
+  assert.ok(notArray.some(error => error.includes('adoptedChildIds must be an array of non-empty child session ids.')), `a non-array value must be refused: ${notArray.join('; ')}`)
+  const notString = attestSchemaErrors({ repository_root: process.cwd(), adoptedChildIds: [123] })
+  assert.ok(notString.some(error => error.includes('adoptedChildIds must be an array of non-empty child session ids.')), `a non-string entry must be refused: ${notString.join('; ')}`)
 })
