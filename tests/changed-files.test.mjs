@@ -265,3 +265,17 @@ test('T5 only the two catalog files are hidden from change detection', async t =
   const changed = snap.between(before, snap.tree())
   assert.deepEqual(changed, ['.dsh/notes.md'], `only the non-catalog file should be seen: ${JSON.stringify(changed)}`)
 })
+
+test('T5 a catalog under a bracket-named directory stays hidden from change detection', async t => {
+  const repo = tempRepo(t)
+  const bracket = path.join(repo, '[id]')
+  fs.mkdirSync(bracket)
+  const exclusion = await excludeCatalog(bracket)
+  assert.equal(exclusion.applied, true, 'the bracket-named root carries an exclusion')
+  const snap = snapshotter(repo, t)
+  const before = snap.tree()
+  fs.mkdirSync(path.join(bracket, '.dsh'))
+  fs.writeFileSync(path.join(bracket, '.dsh', 'verification.json'), 'catalog\n')
+  const changed = snap.between(before, snap.tree())
+  assert.deepEqual(changed, [], `the escaped pattern hides the catalog from git: ${JSON.stringify(changed)}`)
+})

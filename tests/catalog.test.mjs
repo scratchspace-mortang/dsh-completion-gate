@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CompletionGateService } from '../lib/index.js'
-import { archivePathOf, isStale, readArchive, registerItems } from '../lib/catalog.js'
+import { archivePathOf, excludeCatalog, isStale, readArchive, registerItems } from '../lib/catalog.js'
 
 // Test workspaces live under the task's Trash root, never the system temporary directory (AGENTS.md). The tests never
 // delete them, so each run leaves its workspaces in that Trash root for the user to clear.
@@ -172,15 +172,105 @@ test('T5 the exact archive path is excluded, not the whole .dsh/ directory', asy
   assert.equal(spawnSync('git', ['check-ignore', '-q', '.dsh/verification-archive.json'], { cwd: repo }).status, 0, 'the archive is ignored')
 })
 
+test('T5 excludeCatalog ignores both catalogs when the given root is a symlink into the repository', async t => {
+  const repo = gitRepo('symlink-root-')
+  const link = path.join(path.dirname(repo), `link-${path.basename(repo)}`)
+  fs.symlinkSync(repo, link)
+  const result = await excludeCatalog(link)
+  assert.equal(result.applied, true, 'the symlinked root resolves to the repository')
+  assert.equal(result.added, true, 'the two patterns are written')
+  for (const file of ['.dsh/verification.json', '.dsh/verification-archive.json']) {
+    assert.equal(spawnSync('git', ['check-ignore', '-q', file], { cwd: repo }).status, 0, `git ignores ${file} relative to the physical top level`)
+  }
+  const lines = excludeLines(repo)
+  assert.equal(lines.some(line => line.includes('..')), false, `no pattern climbs out of the work tree: ${lines.join('|')}`)
+})
+
+test('T5 excludeCatalog ignores both catalogs under a directory whose name begins with #', async t => {
+  const repo = gitRepo('hash-root-')
+  const nested = path.join(repo, '#notes')
+  fs.mkdirSync(nested)
+  const result = await excludeCatalog(nested)
+  assert.equal(result.applied, true, 'the nested root is inside the repository')
+  for (const file of ['#notes/.dsh/verification.json', '#notes/.dsh/verification-archive.json']) {
+    assert.equal(spawnSync('git', ['check-ignore', '-q', file], { cwd: repo }).status, 0, `git ignores ${file} as a literal path`)
+  }
+})
+
+test('T5 excludeCatalog ignores both catalogs under a directory named [id]', async t => {
+  const repo = gitRepo('bracket-root-')
+  const nested = path.join(repo, '[id]')
+  fs.mkdirSync(nested)
+  const result = await excludeCatalog(nested)
+  assert.equal(result.applied, true, 'the nested root is inside the repository')
+  for (const file of ['[id]/.dsh/verification.json', '[id]/.dsh/verification-archive.json']) {
+    assert.equal(spawnSync('git', ['check-ignore', '-q', file], { cwd: repo }).status, 0, `git ignores ${file} as a literal path`)
+  }
+  const lines = excludeLines(repo)
+  assert.ok(lines.includes('\\[id\\]/.dsh/verification.json'), `the bracket is escaped in the exclude file: ${lines.join('|')}`)
+})
+
+test('T5 excludeCatalog refuses a root whose catalog path would carry a newline', async t => {
+  const repo = gitRepo('newline-root-')
+  const nested = path.join(repo, 'line\nbreak')
+  fs.mkdirSync(nested)
+  const before = excludeLines(repo)
+  const result = await excludeCatalog(nested)
+  assert.equal(result.applied, false, 'the invalid pattern is refused')
+  assert.match(result.reason, /cannot be written as a git exclude pattern/)
+  assert.deepEqual(excludeLines(repo), before, 'no line is written to the exclude file')
+})
+
+test('T5 a failed exclude rename leaves the prior bytes and an active user rule intact', async t => {
+  const repo = gitRepo('exclude-rename-fail-')
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  const seed = '# keep me\n*.log\n.dsh/\n'
+  fs.writeFileSync(exclude, seed)
+  const restore = failRenameOn('exclude')
+  let error
+  try { await excludeCatalog(repo) } catch (thrown) { error = thrown } finally { restore() }
+  assert.ok(error, 'the failed atomic rename rejects')
+  assert.match(error.message, /simulated rename failure/)
+  assert.equal(fs.readFileSync(exclude, 'utf8'), seed, 'the prior bytes survive byte-for-byte')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', 'probe.log'], { cwd: repo }).status, 0, 'the pre-existing *.log rule still ignores')
+  assert.deepEqual(fs.readdirSync(path.join(repo, '.git', 'info')).filter(name => name.endsWith('.tmp')), [], 'no temp file is left behind')
+})
+
+test('T5 a failed exclude temp write leaves the prior bytes and no empty .tmp behind', async t => {
+  const repo = gitRepo('exclude-temp-fail-')
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  const seed = '# keep me\n*.log\n.dsh/\n'
+  fs.writeFileSync(exclude, seed)
+  const original = fs.writeFileSync
+  fs.writeFileSync = (file, ...rest) => {
+    if (String(file).endsWith('.tmp')) {
+      original(file, '')
+      throw new Error('simulated temp write failure')
+    }
+    return original(file, ...rest)
+  }
+  let error
+  try { await excludeCatalog(repo) } catch (thrown) { error = thrown } finally { fs.writeFileSync = original }
+  assert.ok(error, 'the failed temp write rejects')
+  assert.match(error.message, /simulated temp write failure/)
+  assert.equal(fs.readFileSync(exclude, 'utf8'), seed, 'the prior bytes survive byte-for-byte')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', 'probe.log'], { cwd: repo }).status, 0, 'the pre-existing *.log rule still ignores')
+  assert.deepEqual(fs.readdirSync(path.join(repo, '.git', 'info')).filter(name => name.endsWith('.tmp')), [], 'no empty .tmp is left behind')
+})
+
 test('T5 a pre-existing whole-directory .dsh/ line is replaced by the two exact paths', async t => {
   const repo = gitRepo()
-  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '.dsh/\n')
+  fs.writeFileSync(path.join(repo, '.git', 'info', 'exclude'), '# keep me\n*.log\n.dsh/\n')
   const svc = gateFor(t)
   await register(svc, agentIn(repo), repo, [{ name: 'Lint', proves: 'No lint errors.' }])
   const lines = excludeLines(repo)
   assert.equal(lines.includes('.dsh/'), false, 'the old whole-directory line is gone')
   assert.ok(lines.includes('.dsh/verification.json'), 'the exact catalog path replaced it')
   assert.ok(lines.includes('.dsh/verification-archive.json'), 'the exact archive path replaced it')
+  assert.ok(lines.includes('*.log'), 'the unrelated *.log rule survives byte-for-byte')
+  assert.ok(lines.includes('# keep me'), 'the unrelated comment survives byte-for-byte')
+  const ignored = spawnSync('git', ['check-ignore', '-q', 'probe.log'], { cwd: repo })
+  assert.equal(ignored.status, 0, 'the surviving *.log rule still ignores a log file')
 })
 
 test('T5 a command between the old and new bounds is accepted', async t => {
@@ -196,6 +286,17 @@ test('T5 a command over 4000 characters is refused with the bound named', async 
   const svc = gateFor(t)
   await assert.rejects(register(svc, agentIn(repo), repo, [{ name: 'Too long', proves: 'It is refused.', command: 'x'.repeat(4001) }]), /4000 characters/)
   assert.equal(fs.existsSync(path.join(repo, '.dsh')), false, 'no catalog is written')
+})
+
+test('T5 a command of exactly 4000 characters is stored whole', async t => {
+  const repo = gitRepo()
+  const svc = gateFor(t)
+  const command = 'x'.repeat(4000)
+  let refused = null
+  try { await register(svc, agentIn(repo), repo, [{ name: 'At the bound', proves: 'It is accepted.', command }]) }
+  catch (error) { refused = error }
+  assert.equal(refused, null, `a 4000-character command is accepted: ${refused?.message}`)
+  assert.equal(readCatalog(repo).items[0].command, command, 'the 4000-character command is stored whole')
 })
 
 test('a corrupt catalog makes register refuse, naming the path and the parse failure, and leaves its bytes unchanged', async t => {
