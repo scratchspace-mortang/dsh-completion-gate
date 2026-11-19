@@ -1267,6 +1267,36 @@ test('T4 a group in reviewed_code_files is counted and its covered paths are hid
   }
 })
 
+// T4-R2-1: a group filed only in adopted_files is counted once and hides the paths it covers.
+test('T4 a group in adopted_files is counted and its covered paths are hidden', async t => {
+  const { session, svc, a } = await attestFixture(t, ['ad-a.js', 'ad-b.js'])
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'ad-a.js', decision: 'mine' }, { path: 'ad-b.js', decision: 'mine' }],
+    adopted_files: ['ad-*'],
+    items: [],
+  }), execOf(a))
+  const lines = result.markdown.split('\n')
+  assert.ok(lines.includes('2 paths matched by ad-*'), `the adopted group is counted: ${result.markdown}`)
+  for (const name of ['ad-a.js', 'ad-b.js']) {
+    assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the adopted group: ${result.markdown}`)
+  }
+})
+
+// T4-R2-1: a group filed only in demonstrated_files is counted once and hides the paths it covers.
+test('T4 a group in demonstrated_files is counted and its covered paths are hidden', async t => {
+  const { session, svc, a } = await attestFixture(t, ['de-a.js', 'de-b.js'])
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'de-a.js', decision: 'mine' }, { path: 'de-b.js', decision: 'mine' }],
+    demonstrated_files: [{ path: 'de-*', note: 'ran the fixture' }],
+    items: [],
+  }), execOf(a))
+  const lines = result.markdown.split('\n')
+  assert.ok(lines.includes('2 paths matched by de-*'), `the demonstrated group is counted: ${result.markdown}`)
+  for (const name of ['de-a.js', 'de-b.js']) {
+    assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the demonstrated group: ${result.markdown}`)
+  }
+})
+
 // T4-R1-16: the ignored-field warning belongs to the call that carried the extras, not to every attest or status read.
 test('T4 the ignored-field warning is scoped to the attest that carried the extras', async t => {
   const { session, svc, a } = await attestFixture(t)
@@ -1285,6 +1315,8 @@ test('T4 the ignored-field warning is scoped to the attest that carried the extr
   const extrasWarnings = warnings(extras.markdown)
   assert.equal(extrasWarnings.length, 1, `exactly one warning on the extras call: ${extras.markdown}`)
   for (const field of ['name', 'proves', 'command']) assert.ok(extrasWarnings[0].includes(field), `the warning names ${field}`)
+  const laterClean = await svc.__tool.execute(attestArgs(session, { ...base, items: [{ id: 'unit', state: 'passed' }] }), execOf(a))
+  assert.deepEqual(warnings(laterClean.markdown), [], `a later clean attest emits no warning: ${laterClean.markdown}`)
   const later = await svc.__tool.execute({ action: 'status' }, execOf(a))
   assert.deepEqual(warnings(later.markdown), [], `a later status read emits no warning: ${later.markdown}`)
 })
