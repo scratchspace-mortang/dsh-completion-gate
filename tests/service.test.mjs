@@ -1126,3 +1126,86 @@ test('no source file imports a removed execution module', () => {
     }
   }
 })
+
+// T4 (zy7q): compact report, verbose route, batch line, and frictionless items. Each case below fails at the
+// pre-dispatch HEAD because those rules are not implemented yet; the mutation ledger pins them after implementation.
+test('T4 compact attest counts a group instead of listing each filed path', async t => {
+  const { session, svc, a } = await attestFixture(t, ['shared-a.js', 'shared-b.js', 'shared-c.js'])
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'shared-*', decision: 'not-mine' }], items: [],
+  }), execOf(a))
+  const lines = result.markdown.split('\n')
+  assert.ok(lines.includes('3 paths matched by shared-*'), `the group is counted: ${result.markdown}`)
+  for (const name of ['shared-a.js', 'shared-b.js', 'shared-c.js']) {
+    assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode lists ${name} individually: ${result.markdown}`)
+  }
+})
+
+test('T4 status and attest print one line naming the supported verbose route', async t => {
+  const { session, svc, a } = await attestFixture(t, ['app.js'])
+  const route = 'call the completion_gate tool with action attest and verbose true'
+  const status = await svc.__tool.execute({ action: 'status' }, execOf(a))
+  assert.ok(status.markdown.split('\n').some(line => line.includes(route)), `status names the route: ${status.markdown}`)
+  const attested = await svc.__tool.execute(attestArgs(session, { claims: [{ path: 'app.js', decision: 'not-mine' }], items: [] }), execOf(a))
+  assert.ok(attested.markdown.split('\n').some(line => line.includes(route)), `attest names the route: ${attested.markdown}`)
+})
+
+test('T4 compact attest prints one counted before_commit rejection line', async t => {
+  const { session, svc, a } = await attestFixture(t, ['old.js', 'new.js', 'dirty.js'])
+  const commit = message => {
+    execFileSync('git', ['add', message], { cwd: session })
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', message], { cwd: session })
+  }
+  commit('old.js')
+  commit('new.js')
+  fs.writeFileSync(path.join(session, 'dirty.js'), 'uncommitted change\n')
+  const named = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: session, encoding: 'utf8' }).trim()
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ before_commit: named, decision: 'not-mine' }], items: [],
+  }), execOf(a))
+  assert.ok(result.markdown.split('\n').includes(`1 paths rejected by before_commit ${named}`), `the count names the batch: ${result.markdown}`)
+})
+
+test('T4 verbose attest restores one line per filed path and drops counted lines', async t => {
+  const { session, svc, a } = await attestFixture(t, ['shared-a.js', 'shared-b.js', 'shared-c.js'])
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'shared-*', decision: 'not-mine' }], items: [], verbose: true,
+  }), execOf(a))
+  const lines = result.markdown.split('\n')
+  for (const name of ['shared-a.js', 'shared-b.js', 'shared-c.js']) {
+    assert.ok(lines.includes(`- ${path.join(session, name)} (not-mine, rejected, so no review or demonstration is owed)`), `verbose lists ${name}: ${result.markdown}`)
+  }
+  assert.ok(!lines.some(line => line.includes('paths matched by')), 'verbose has no counted group line')
+})
+
+test('T4 attest accepts harmless extra item fields with a warning naming them', async t => {
+  const { session, svc, a } = await attestFixture(t, ['app.js'])
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'],
+    demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+    items: [{ id: 'unit', state: 'passed', name: 'Unit', proves: 'app.js sets value', command: 'npm test' }],
+  }), execOf(a))
+  const warning = result.markdown.split('\n').find(line => line.startsWith('Warning:'))
+  assert.ok(warning, `a warning line is present: ${result.markdown}`)
+  for (const field of ['name', 'proves', 'command']) assert.ok(warning.includes(field), `the warning names ${field}: ${warning}`)
+  assert.ok(result.markdown.includes('- unit: Unit | passed'), 'the item state still counts')
+})
+
+test('T4 unknown item keys stay refused even while harmless extras warn', async t => {
+  const { session, svc, a } = await attestFixture(t, ['app.js'])
+  await assert.rejects(svc.__tool.execute(attestArgs(session, {
+    claims: [], items: [{ id: 'unit', state: 'passed', bogus: true }],
+  }), execOf(a)), /items\[0\] has an unknown key: bogus\./)
+})
+
+test('T4 the tool advertises verbose while status and report commands stay compact', async t => {
+  const svc = statusService(new Map())
+  t.after(() => cleanupService(svc))
+  assert.deepEqual(svc.__tool.parameters.properties.verbose, { type: 'boolean', description: 'Show one line per filed path instead of the compact counts. Only the attest action uses it.' })
+  const { session, svc: live, a } = await attestFixture(t, ['app.js'])
+  const route = 'call the completion_gate tool with action attest and verbose true'
+  const status = await live.__tool.execute({ action: 'status', verbose: true }, execOf(a))
+  assert.ok(status.markdown.includes(route), 'status stays compact even when a verbose argument is sent')
+  assert.equal(typeof svc.__commands.gate.handler, 'function', 'the gate command handler stays argument-free')
+})

@@ -594,7 +594,7 @@ test('attest refuses each malformed argument and each unknown path or item with 
     [attestArgs(session, { items: [{ id: 'unit', state: 'passed', reason: 'ran it' }] }), /items\[0\] is passed, so it takes no reason\./],
     [attestArgs(session, { items: [{ id: 'unit', state: 'irrelevant' }] }), /items\[0\]\.state must be passed, assumed, or unrelated\./],
     [attestArgs(session, { items: [{ id: 'unit', state: 'unrelated', reason: 'not my work' }] }), /items\[0\] is unrelated, so it takes no reason\./],
-    [attestArgs(session, { items: [{ id: 'unit', state: 'passed', name: 'Unit' }] }), /items\[0\] has an unknown key: name\./],
+    [attestArgs(session, { items: [{ id: 'unit', state: 'passed', bogus: true }] }), /items\[0\] has an unknown key: bogus\./],
     [attestArgs(session, { items: [{ id: 'nope', state: 'passed' }] }), /nope is not an item in this repository's catalog\./],
     [attestArgs(session, { docs_checked: 'yes' }), /docs_checked must be true or false\./],
     [attestArgs(session, { summary: 3 }), /summary must be a string\./],
@@ -608,6 +608,17 @@ test('attest refuses each malformed argument and each unknown path or item with 
     })
   }
   assert.equal(JSON.stringify(await svc.repositoryReport(a)), before, 'a refused attest changes no claim, item state, or attestation')
+})
+
+test('attest accepts an item name field and warns that only the relevant fields were used', async t => {
+  const { session, svc, a } = await attestFixture(t)
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [], items: [{ id: 'unit', state: 'passed', name: 'Unit' }],
+  }), execOf(a))
+  const warning = result.markdown.split('\n').find(line => line.startsWith('Warning:'))
+  assert.ok(warning, `a warning line is present: ${result.markdown}`)
+  assert.match(warning, /name/, `the warning names the ignored field: ${warning}`)
+  assert.ok(result.markdown.includes('- unit: Unit | passed'), 'the item state still counts')
 })
 
 test('attest refuses an explicit null for claims, reviewed_code_files, docs_checked, items, or summary, and changes nothing', async t => {
