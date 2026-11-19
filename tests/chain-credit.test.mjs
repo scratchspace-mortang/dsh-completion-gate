@@ -1086,7 +1086,9 @@ test('T3 a shorter writer id is not adopted by naming a longer child id', async 
     let message = ''
     try { await svc.attest(agent, args) } catch (error) { message = error.message }
     assert.match(message, /adopt/i, `naming child-10 must refuse writer child-1: ${message}`)
-    assert.match(message, /child-1/, `the refusal names the uncovered writer: ${message}`)
+    const claimingMine = message.split('\n').find(line => line.includes('so claiming it mine'))
+    assert.ok(claimingMine, `the refusal names the claiming-mine line: ${message}`)
+    assert.match(claimingMine, /was written by child-1(?!\d)/, `the refusal names the uncovered writer: ${message}`)
     const accepted = await svc.attest(agent, { ...args, adoptedChildIds: ['child-1'] })
     assert.equal(accepted.pass, true, `naming the exact writer adopts it: ${JSON.stringify(accepted.blockers)}`)
   })
