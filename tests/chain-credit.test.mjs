@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { CompletionGateService } from '../lib/index.js'
+import { adoptionCovers, attestSchemaErrors } from '../lib/tracker.js'
 import { userMessage } from './user-message.mjs'
 
 // Chain credit (ticket x9qb): a dispatched child writer's write/edit call files
@@ -708,5 +709,207 @@ test('parent disposal deletes markers once the attestation covers the child writ
     assert.ok(fs.readdirSync(svc.changes.creditedDir).length > 0, 'precondition: a retained marker exists')
     await svc.disposeSession(parent.id, repo)
     assert.deepEqual(fs.readdirSync(svc.changes.creditedDir), [], 'disposal deletes the markers the attestation covers')
+  })
+})
+
+// T3: all-turn child adoption by session id. These cases drive the real service
+// the way the host publishes child turns, then attest through the recorded
+// tracker state, so they pin adoptedChildIds at the same seam as the other
+// chain-credit cases rather than reconstructing the tracker in the test.
+
+function adoptArgs(paths, repo, extra = {}) {
+  return {
+    action: 'attest',
+    repository_root: repo,
+    claims: paths.map(p => ({ path: p, decision: 'mine' })),
+    reviewed_code_files: paths,
+    demonstrated_files: paths.map(p => ({ path: p, note: `ran ${p}` })),
+    summary: 'Adopted the named child writes.',
+    ...extra,
+  }
+}
+
+// Captures the published tool schema and system-prompt section the way the host
+// registers them, so the model-facing guidance can be read without a live host.
+function capturedService() {
+  const listeners = new Map()
+  const off = () => () => {}
+  let tool = null
+  let prompt = null
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'cg-t3-capture-')))
+  const ctx = {
+    reflect: { get: () => undefined },
+    on: (name, listener) => { listeners.set(name, listener); return off() },
+    provide: off,
+    tools: { register: definition => { tool = definition; return off() } },
+    commands: { register: off },
+    systemPrompt: { section: definition => { prompt = definition; return off() } },
+    webServer: { register: off },
+  }
+  const svc = new CompletionGateService(ctx, {}, { settingsPath: path.join(dir, 'settings.json') })
+  svc.__testSettingsDir = dir
+  svc.__tool = () => tool
+  svc.__prompt = () => prompt
+  svc.start()
+  return svc
+}
+
+function adoptedFilesOf(report) {
+  const files = report.repositories.flatMap(repo => repo.files)
+  return new Map(files.map(file => [path.basename(file.absolute), file]))
+}
+
+test('T3 naming a child adopts every path that child wrote in any turn', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'a.js'), 'const a = 1\n')
+  fs.writeFileSync(path.join(repo, 'b.js'), 'const b = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, child, 1, 'a.js')
+    writerTurn(svc, child, 2, 'b.js')
+    const agent = agentFor(repo, parent.id)
+    const args = adoptArgs(['a.js', 'b.js'], repo, { adoptedChildIds: ['child-1'] })
+    await assert.rejects(svc.attest(agent, { ...args, adoptedChildIds: undefined }), /adopt/i, 'without a child id neither turn is adopted')
+    const accepted = await svc.attest(agent, args)
+    assert.equal(accepted.pass, true, `naming the child must adopt both turns: ${JSON.stringify(accepted.blockers)}`)
+    const files = adoptedFilesOf(await svc.repositoryReport(agent))
+    assert.ok(files.get('a.js').adoptedFor.includes('child-1#1'), 'the turn 1 provenance is adopted')
+    assert.ok(files.get('b.js').adoptedFor.includes('child-1#2'), 'the turn 2 provenance is adopted')
+  })
+})
+
+test('T3 a write from a later turn is adopted by naming the child', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'a.js'), 'const a = 1\n')
+  fs.writeFileSync(path.join(repo, 'late.js'), 'const late = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, child, 1, 'a.js')
+    writerTurn(svc, child, 2, 'late.js')
+    const agent = agentFor(repo, parent.id)
+    const args = {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'a.js', decision: 'not-mine' }, { path: 'late.js', decision: 'mine' }],
+      reviewed_code_files: ['late.js'],
+      demonstrated_files: [{ path: 'late.js', note: 'ran the fixture' }],
+      adoptedChildIds: ['child-1'], summary: 'Adopted the later turn.',
+    }
+    const accepted = await svc.attest(agent, args)
+    assert.equal(accepted.pass, true, `the later turn must be covered by the child id: ${JSON.stringify(accepted.blockers)}`)
+    const files = adoptedFilesOf(await svc.repositoryReport(agent))
+    assert.ok(files.get('late.js').adoptedFor.includes('child-1#2'), 'the later turn provenance entry is recorded as adopted')
+  })
+})
+
+test('T3 explicit adopted_files survive when a child id is resolved', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'a.js'), 'const a = 1\n')
+  fs.writeFileSync(path.join(repo, 'b.js'), 'const b = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const named = childOf(repo, parent.id, 'child-1', 1)
+    const other = childOf(repo, parent.id, 'child-2', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, named, 1, 'a.js')
+    writerTurn(svc, other, 1, 'b.js')
+    const agent = agentFor(repo, parent.id)
+    const args = adoptArgs(['a.js', 'b.js'], repo, { adoptedChildIds: ['child-1'], adopted_files: ['b.js'] })
+    const accepted = await svc.attest(agent, args)
+    assert.equal(accepted.pass, true, `the explicit adoption must survive resolving the child id: ${JSON.stringify(accepted.blockers)}`)
+    const files = adoptedFilesOf(await svc.repositoryReport(agent))
+    assert.ok(files.get('b.js').adoptedFor.includes('child-2#1'), 'the explicitly adopted writer stays adopted')
+  })
+})
+
+test('T3 an unnamed writer is not adopted by naming a different child', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'a.js'), 'const a = 1\n')
+  fs.writeFileSync(path.join(repo, 'b.js'), 'const b = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const named = childOf(repo, parent.id, 'child-1', 1)
+    const other = childOf(repo, parent.id, 'child-2', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, named, 1, 'a.js')
+    writerTurn(svc, other, 1, 'b.js')
+    const agent = agentFor(repo, parent.id)
+    const args = adoptArgs(['a.js', 'b.js'], repo, { adoptedChildIds: ['child-1'] })
+    let message = ''
+    try { await svc.attest(agent, args) } catch (error) { message = error.message }
+    assert.match(message, /adopt/i, `the unnamed writer must stay unadopted: ${message}`)
+    assert.match(message, /b\.js/, 'the refusal names the unnamed writer path')
+  })
+})
+
+test('T3 a path another session also wrote still needs that session adoption', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'shared.js'), 'const shared = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const named = childOf(repo, parent.id, 'child-1', 1)
+    const other = childOf(repo, parent.id, 'child-2', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, named, 1, 'shared.js')
+    writerTurn(svc, other, 1, 'shared.js')
+    const agent = agentFor(repo, parent.id)
+    const args = adoptArgs(['shared.js'], repo, { adoptedChildIds: ['child-1'] })
+    let message = ''
+    try { await svc.attest(agent, args) } catch (error) { message = error.message }
+    assert.match(message, /adopt/i, `the second writer's bytes still need adoption: ${message}`)
+    const accepted = await svc.attest(agent, { ...args, adopted_files: ['shared.js'] })
+    assert.equal(accepted.pass, true, `adopting the second writer must pass: ${JSON.stringify(accepted.blockers)}`)
+  })
+})
+
+test('T3 a not-mine rejection records no adoption even when the child is named', async t => {
+  const repo = tempRepo()
+  fs.writeFileSync(path.join(repo, 'a.js'), 'const a = 1\n')
+  fs.writeFileSync(path.join(repo, 'b.js'), 'const b = 1\n')
+  await withCleanup(service(), async svc => {
+    const parent = parentOf(repo)
+    const child = childOf(repo, parent.id, 'child-1', 1)
+    parentIdleTurn(svc, parent, 1)
+    writerTurn(svc, child, 1, 'a.js')
+    writerTurn(svc, child, 1, 'b.js')
+    const agent = agentFor(repo, parent.id)
+    const accepted = await svc.attest(agent, {
+      action: 'attest', repository_root: repo,
+      claims: [{ path: 'a.js', decision: 'mine' }, { path: 'b.js', decision: 'not-mine' }],
+      reviewed_code_files: ['a.js'],
+      demonstrated_files: [{ path: 'a.js', note: 'ran the fixture' }],
+      adoptedChildIds: ['child-1'], summary: 'Rejected one child write.',
+    })
+    assert.equal(accepted.pass, true, `the accepted call must be complete: ${JSON.stringify(accepted.blockers)}`)
+    const files = adoptedFilesOf(await svc.repositoryReport(agent))
+    assert.equal(files.get('a.js').adopted, true, 'the mine file records adoption')
+    assert.equal(files.get('b.js').adopted, false, 'a not-mine file never records adoption')
+    assert.deepEqual(files.get('b.js').adoptedFor, [], 'a not-mine file keeps no adopted-for entries')
+  })
+})
+
+test('T3 adoptionCovers requires the adopted flag for empty provenance', () => {
+  const uncredited = { provenance: [], adoptedFor: [], adopted: false }
+  assert.equal(adoptionCovers(uncredited), false, 'empty provenance still needs the adopted flag')
+  assert.equal(adoptionCovers({ ...uncredited, adopted: true }), true, 'a flag-backed adoption covers an uncredited file')
+})
+
+test('T3 adoptedChildIds is a published attest argument with matching schema and prompt guidance', async t => {
+  assert.deepEqual(attestSchemaErrors({ repository_root: process.cwd(), adoptedChildIds: ['child-1'] }), [], 'the handler accepts adoptedChildIds')
+  assert.ok(attestSchemaErrors({ repository_root: process.cwd(), unknownT3: 1 }).some(error => error.includes('Unknown argument: unknownT3')), 'unknown keys stay refused')
+  assert.ok(attestSchemaErrors({ repository_root: process.cwd(), adoptedChildIds: ['   '] }).some(error => error.includes('adoptedChildIds must be an array of non-empty')), 'blank child ids are refused')
+  await withCleanup(capturedService(), async svc => {
+    const prop = svc.__tool().parameters.properties.adoptedChildIds
+    assert.ok(prop, 'the tool schema publishes adoptedChildIds')
+    assert.equal(prop.type, 'array', 'the property is an array of session ids')
+    assert.equal(prop.items.pattern, '\\S', 'the property refuses whitespace-only ids')
+    assert.match(prop.description, /any turn|every turn/, 'the property says naming a child covers every turn')
+    assert.match(prop.description, /another session.*adoption/i, 'the property keeps the other-session rule')
+    const prompt = svc.__prompt().text
+    assert.match(prompt, /adoptedChildIds/, 'the system-prompt adoption paragraph names adoptedChildIds')
+    assert.match(prompt, /any turn|every turn/, 'the system prompt states the same all-turn rule')
   })
 })
