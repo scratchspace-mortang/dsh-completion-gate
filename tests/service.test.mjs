@@ -1276,7 +1276,7 @@ test('T4 a group in adopted_files is counted and its covered paths are hidden', 
     items: [],
   }), execOf(a))
   const lines = result.markdown.split('\n')
-  assert.ok(lines.includes('2 paths matched by ad-*'), `the adopted group is counted: ${result.markdown}`)
+  assert.deepEqual(lines.filter(line => line.includes('paths matched by')), ['2 paths matched by ad-*'], `the adopted group is counted: ${result.markdown}`)
   for (const name of ['ad-a.js', 'ad-b.js']) {
     assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the adopted group: ${result.markdown}`)
   }
@@ -1291,7 +1291,7 @@ test('T4 a group in demonstrated_files is counted and its covered paths are hidd
     items: [],
   }), execOf(a))
   const lines = result.markdown.split('\n')
-  assert.ok(lines.includes('2 paths matched by de-*'), `the demonstrated group is counted: ${result.markdown}`)
+  assert.deepEqual(lines.filter(line => line.includes('paths matched by')), ['2 paths matched by de-*'], `the demonstrated group is counted: ${result.markdown}`)
   for (const name of ['de-a.js', 'de-b.js']) {
     assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the demonstrated group: ${result.markdown}`)
   }
