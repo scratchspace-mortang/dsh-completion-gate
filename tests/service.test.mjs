@@ -1209,3 +1209,82 @@ test('T4 the tool advertises verbose while status and report commands stay compa
   assert.ok(status.markdown.includes(route), 'status stays compact even when a verbose argument is sent')
   assert.equal(typeof svc.__commands.gate.handler, 'function', 'the gate command handler stays argument-free')
 })
+
+// T4-R1-9 and T4-R1-3: two before_commit entries in one attest are two batches, not one joined name. The first attest
+// below files an earlier not-mine path, so the two batches are a follow-up after earlier not-mine claims through the
+// same registered tool; no API boundary blocks it.
+test('T4 two before_commit batches print one counted line each with its own name and count', async t => {
+  const { session, svc, a } = await attestFixture(t, ['old1.js', 'old2.js', 'new.js'])
+  const commit = message => {
+    execFileSync('git', ['add', message], { cwd: session })
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', message], { cwd: session })
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: session, encoding: 'utf8' }).trim()
+  }
+  commit('old1.js')
+  const older = commit('old2.js')
+  const newer = commit('new.js')
+  const earlier = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'new.js', decision: 'not-mine' }], items: [],
+  }), execOf(a))
+  assert.ok(!earlier.markdown.includes('paths rejected by before_commit'), 'no batch line before a batch is filed')
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ before_commit: older, decision: 'not-mine' }, { before_commit: newer, decision: 'not-mine' }], items: [],
+  }), execOf(a))
+  const lines = result.markdown.split('\n').filter(line => line.includes('paths rejected by before_commit'))
+  assert.ok(lines.includes(`1 paths rejected by before_commit ${older}`), `own count for ${older}: ${result.markdown}`)
+  assert.ok(lines.includes(`2 paths rejected by before_commit ${newer}`), `own count for ${newer}: ${result.markdown}`)
+  assert.equal(lines.length, 2, `one counted line per batch: ${result.markdown}`)
+  assert.ok(!lines.some(line => line.includes(', ')), `no batch line joins two commit names: ${result.markdown}`)
+})
+
+// T4-R1-10: one group value filed in four arguments is one group, so it gets one counted line.
+test('T4 one group value in four arguments prints one counted line', async t => {
+  const { session, svc, a } = await attestFixture(t, ['shared-a.js', 'shared-b.js'])
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'shared-*', decision: 'not-mine' }],
+    reviewed_code_files: ['shared-*'],
+    adopted_files: ['shared-*'],
+    demonstrated_files: [{ path: 'shared-*', note: 'ran the fixture' }],
+    items: [],
+  }), execOf(a))
+  const lines = result.markdown.split('\n').filter(line => line.includes('paths matched by'))
+  assert.deepEqual(lines, ['2 paths matched by shared-*'], `one counted line per group value: ${result.markdown}`)
+})
+
+// T4-R1-14: groups outside claims still count and still hide the paths they cover.
+test('T4 a group in reviewed_code_files is counted and its covered paths are hidden', async t => {
+  const { session, svc, a } = await attestFixture(t, ['rev-a.js', 'rev-b.js'])
+  const result = await svc.__tool.execute(attestArgs(session, {
+    claims: [{ path: 'rev-a.js', decision: 'mine' }, { path: 'rev-b.js', decision: 'mine' }],
+    reviewed_code_files: ['rev-*'],
+    demonstrated_files: [{ path: 'rev-a.js', note: 'ran the fixture' }, { path: 'rev-b.js', note: 'ran the fixture' }],
+    items: [],
+  }), execOf(a))
+  const lines = result.markdown.split('\n')
+  assert.ok(lines.includes('2 paths matched by rev-*'), `the reviewed group is counted: ${result.markdown}`)
+  for (const name of ['rev-a.js', 'rev-b.js']) {
+    assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the reviewed group: ${result.markdown}`)
+  }
+})
+
+// T4-R1-16: the ignored-field warning belongs to the call that carried the extras, not to every attest or status read.
+test('T4 the ignored-field warning is scoped to the attest that carried the extras', async t => {
+  const { session, svc, a } = await attestFixture(t)
+  const warnings = markdown => markdown.split('\n').filter(line => line.startsWith('Warning:'))
+  const base = {
+    claims: [{ path: 'app.js', decision: 'mine' }],
+    reviewed_code_files: ['app.js'],
+    demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }],
+  }
+  const clean = await svc.__tool.execute(attestArgs(session, { ...base, items: [{ id: 'unit', state: 'passed' }] }), execOf(a))
+  assert.deepEqual(warnings(clean.markdown), [], `a clean attest emits no warning: ${clean.markdown}`)
+  const extras = await svc.__tool.execute(attestArgs(session, {
+    ...base,
+    items: [{ id: 'unit', state: 'passed', name: 'Unit', proves: 'app.js sets value', command: 'npm test' }],
+  }), execOf(a))
+  const extrasWarnings = warnings(extras.markdown)
+  assert.equal(extrasWarnings.length, 1, `exactly one warning on the extras call: ${extras.markdown}`)
+  for (const field of ['name', 'proves', 'command']) assert.ok(extrasWarnings[0].includes(field), `the warning names ${field}`)
+  const later = await svc.__tool.execute({ action: 'status' }, execOf(a))
+  assert.deepEqual(warnings(later.markdown), [], `a later status read emits no warning: ${later.markdown}`)
+})
