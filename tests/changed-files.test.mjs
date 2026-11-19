@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { ChangeTracker, changeDigest, readTurnChanges } from '../lib/changes.js'
 import { addedLinesForRecord, scanSecurity } from '../lib/core.js'
+import { excludeCatalog } from '../lib/catalog.js'
 
 // These tests drive the gate's own turn-scoped source through a fake recorder that mimics
 // the host `workspaceChanges` service: `summary(sessionId, seq)` is synchronous and returns
@@ -249,4 +250,18 @@ test('an added line that begins with two plus signs is still an added line', asy
   const collected = await addedLinesForRecord(service, 'session-1', 5, ['app.js'], new AbortController().signal)
   assert.deepEqual(collected.lines, ['++eval(counter)', 'let ok = 1'])
   assert.deepEqual(scanSecurity(collected.lines).map(hit => hit.id), ['eval'], 'the eval on the added line must be reported')
+})
+
+test('T5 only the two catalog files are hidden from change detection', async t => {
+  const repo = tempRepo(t)
+  const exclusion = await excludeCatalog(repo)
+  assert.equal(exclusion.applied, true, 'the repository can carry the exclusion')
+  const snap = snapshotter(repo, t)
+  const before = snap.tree()
+  fs.mkdirSync(path.join(repo, '.dsh'))
+  fs.writeFileSync(path.join(repo, '.dsh', 'verification.json'), 'catalog\n')
+  fs.writeFileSync(path.join(repo, '.dsh', 'verification-archive.json'), 'archive\n')
+  fs.writeFileSync(path.join(repo, '.dsh', 'notes.md'), 'a note that is not a catalog file\n')
+  const changed = snap.between(before, snap.tree())
+  assert.deepEqual(changed, ['.dsh/notes.md'], `only the non-catalog file should be seen: ${JSON.stringify(changed)}`)
 })

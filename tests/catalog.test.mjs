@@ -134,17 +134,68 @@ test('two different names whose slugs collide get distinct ids', async t => {
   assert.deepEqual(items.map(item => item.name), ['Unit tests', 'unit-tests', 'UNIT TESTS'])
 })
 
-test('the .dsh/ exclude line is appended once across two registers, git ignores the catalog, and .gitignore is unchanged', async t => {
+test('the two exact catalog paths are excluded once across two registers, git ignores both catalogs, and .gitignore is unchanged', async t => {
   const repo = gitRepo()
   fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n')
   const svc = gateFor(t)
   const a = agentIn(repo)
   await register(svc, a, repo, [{ name: 'Lint', proves: 'No lint errors.' }])
   await register(svc, a, repo, [{ name: 'Typecheck', proves: 'No type errors.' }])
-  assert.equal(excludeLines(repo).filter(line => line === '.dsh/').length, 1, 'the exclude line appears exactly once')
+  const lines = excludeLines(repo)
+  assert.equal(lines.filter(line => line === '.dsh/verification.json').length, 1, 'the catalog path appears exactly once')
+  assert.equal(lines.filter(line => line === '.dsh/verification-archive.json').length, 1, 'the archive path appears exactly once')
+  assert.equal(lines.includes('.dsh/'), false, 'the whole .dsh/ directory is not excluded')
   assert.equal(fs.readFileSync(path.join(repo, '.gitignore'), 'utf8'), 'node_modules/\n', 'the tracked .gitignore is not edited')
-  const ignored = spawnSync('git', ['check-ignore', '-q', '.dsh/verification.json'], { cwd: repo })
-  assert.equal(ignored.status, 0, 'git ignores the catalog through the local exclude')
+  for (const file of ['.dsh/verification.json', '.dsh/verification-archive.json']) {
+    const ignored = spawnSync('git', ['check-ignore', '-q', file], { cwd: repo })
+    assert.equal(ignored.status, 0, `git ignores ${file} through the local exclude`)
+  }
+})
+
+test('T5 the exact catalog path is excluded, not the whole .dsh/ directory', async t => {
+  const repo = gitRepo()
+  const svc = gateFor(t)
+  await register(svc, agentIn(repo), repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+  const lines = excludeLines(repo)
+  assert.ok(lines.includes('.dsh/verification.json'), `the exclude file carries the exact catalog path: ${lines.join('|')}`)
+  assert.equal(lines.includes('.dsh/'), false, 'the whole directory is not excluded')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', '.dsh/verification.json'], { cwd: repo }).status, 0, 'the catalog is ignored')
+})
+
+test('T5 the exact archive path is excluded, not the whole .dsh/ directory', async t => {
+  const repo = gitRepo()
+  const svc = gateFor(t)
+  await register(svc, agentIn(repo), repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+  const lines = excludeLines(repo)
+  assert.ok(lines.includes('.dsh/verification-archive.json'), `the exclude file carries the exact archive path: ${lines.join('|')}`)
+  assert.equal(lines.includes('.dsh/'), false, 'the whole directory is not excluded')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', '.dsh/verification-archive.json'], { cwd: repo }).status, 0, 'the archive is ignored')
+})
+
+test('T5 a pre-existing whole-directory .dsh/ line is replaced by the two exact paths', async t => {
+  const repo = gitRepo()
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '.dsh/\n')
+  const svc = gateFor(t)
+  await register(svc, agentIn(repo), repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+  const lines = excludeLines(repo)
+  assert.equal(lines.includes('.dsh/'), false, 'the old whole-directory line is gone')
+  assert.ok(lines.includes('.dsh/verification.json'), 'the exact catalog path replaced it')
+  assert.ok(lines.includes('.dsh/verification-archive.json'), 'the exact archive path replaced it')
+})
+
+test('T5 a command between the old and new bounds is accepted', async t => {
+  const repo = gitRepo()
+  const svc = gateFor(t)
+  const command = 'x'.repeat(1500)
+  await register(svc, agentIn(repo), repo, [{ name: 'Long verification', proves: 'It runs the long scenario.', command }])
+  assert.equal(readCatalog(repo).items[0].command, command, 'the 1500-character command is stored whole')
+})
+
+test('T5 a command over 4000 characters is refused with the bound named', async t => {
+  const repo = gitRepo()
+  const svc = gateFor(t)
+  await assert.rejects(register(svc, agentIn(repo), repo, [{ name: 'Too long', proves: 'It is refused.', command: 'x'.repeat(4001) }]), /4000 characters/)
+  assert.equal(fs.existsSync(path.join(repo, '.dsh')), false, 'no catalog is written')
 })
 
 test('a corrupt catalog makes register refuse, naming the path and the parse failure, and leaves its bytes unchanged', async t => {
@@ -160,7 +211,8 @@ test('a corrupt catalog makes register refuse, naming the path and the parse fai
     return true
   })
   assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'the corrupt catalog is not overwritten')
-  assert.equal(excludeLines(repo).includes('.dsh/'), false, 'a refused register adds no exclude line')
+  assert.equal(excludeLines(repo).includes('.dsh/verification.json'), false, 'a refused register adds no catalog exclusion')
+  assert.equal(excludeLines(repo).includes('.dsh/verification-archive.json'), false, 'a refused register adds no archive exclusion')
 })
 
 test('a root with no git gets the catalog and reports no exclusion, without an error', async t => {
@@ -186,7 +238,9 @@ test('a folder with an empty .git entry inside another repository registers ther
   assert.equal(result.registered.exclusion.applied, true, 'the exclusion is applied through the repository git resolves')
   assert.equal(result.registered.exclusion.added, true)
   assert.equal(fs.realpathSync(result.registered.exclusion.file), fs.realpathSync(path.join(outer, '.git', 'info', 'exclude')), 'the line goes into the outer repository exclude file')
-  assert.equal(excludeLines(outer).includes('.dsh/'), true, 'the outer repository excludes the catalog')
+  assert.equal(excludeLines(outer).includes('nested/.dsh/verification.json'), true, 'the outer repository excludes the nested catalog')
+  assert.equal(excludeLines(outer).includes('nested/.dsh/verification-archive.json'), true, 'the outer repository excludes the nested archive')
+  assert.equal(excludeLines(outer).includes('.dsh/'), false, 'the outer repository does not exclude the whole directory')
   const ignored = spawnSync('git', ['check-ignore', '-q', 'nested/.dsh/verification.json'], { cwd: outer })
   assert.equal(ignored.status, 0, 'git ignores the nested catalog through the outer repository local exclude')
 })
@@ -226,7 +280,8 @@ test('register writes into a symlinked sibling repository, never into the worksp
   await register(svc, a, 'vendor', [{ name: 'Sibling smoke', proves: 'The sibling starts.' }])
   assert.equal(fs.existsSync(path.join(session, '.dsh')), false, 'the workspace gets no catalog')
   assert.equal(readCatalog(sibling).items[0].id, 'sibling-smoke')
-  assert.equal(excludeLines(sibling).includes('.dsh/'), true, 'the sibling excludes its own catalog')
+  assert.equal(excludeLines(sibling).includes('.dsh/verification.json'), true, 'the sibling excludes its own catalog')
+  assert.equal(excludeLines(sibling).includes('.dsh/verification-archive.json'), true, 'the sibling excludes its own archive')
   assert.equal(excludeLines(session).includes('.dsh/'), false, 'the workspace exclude file is unchanged')
 })
 
@@ -244,7 +299,8 @@ test('register writes into a sibling subdirectory that a symlink points at, neve
   await register(svc, a, 'vendor', [{ name: 'Sibling smoke', proves: 'The sibling starts.' }])
   assert.equal(fs.existsSync(path.join(session, '.dsh')), false, 'the workspace gets no catalog')
   assert.equal(readCatalog(sibling).items[0].id, 'sibling-smoke')
-  assert.equal(excludeLines(sibling).includes('.dsh/'), true, 'the sibling excludes its own catalog')
+  assert.equal(excludeLines(sibling).includes('.dsh/verification.json'), true, 'the sibling excludes its own catalog')
+  assert.equal(excludeLines(sibling).includes('.dsh/verification-archive.json'), true, 'the sibling excludes its own archive')
   assert.equal(excludeLines(session).includes('.dsh/'), false, 'the workspace exclude file is unchanged')
 })
 
