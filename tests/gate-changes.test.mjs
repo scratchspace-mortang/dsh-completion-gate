@@ -955,6 +955,14 @@ test('T2 claims validate key presence and agree with the published oneOf schema'
   assert.ok(nonString.some(error => error.includes('before_commit must be a non-empty string')), `a non-string before_commit key must be refused: ${nonString.join('; ')}`)
   const emptyPath = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ path: '', before_commit: 'HEAD', decision: 'not-mine' }] })
   assert.ok(emptyPath.some(error => error.includes('path must be a non-empty string')), `an empty path key must be refused: ${emptyPath.join('; ')}`)
+  // A space counts as one character under minLength, so each whitespace literal must be refused by the handler
+  // and by the pattern the published schema carries for the same field.
+  const whitespacePath = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ path: '   ', decision: 'mine' }] })
+  assert.ok(whitespacePath.some(error => error.includes('path must be a non-empty string')), `a whitespace-only path must be refused by the handler: ${whitespacePath.join('; ')}`)
+  const whitespaceCommit = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ before_commit: '   ', decision: 'not-mine' }] })
+  assert.ok(whitespaceCommit.some(error => error.includes('before_commit must be a non-empty string')), `a whitespace-only before_commit must be refused by the handler: ${whitespaceCommit.join('; ')}`)
+  const whitespaceRoot = attestSchemaErrors({ repository_root: '   ', claims: [] })
+  assert.ok(whitespaceRoot.some(error => error.includes('repository_root is required')), `a whitespace-only repository_root must be refused by the handler: ${whitespaceRoot.join('; ')}`)
   const { registered, dir } = toolService()
   try {
     const oneOf = registered.parameters.properties.claims.items.oneOf
@@ -967,6 +975,22 @@ test('T2 claims validate key presence and agree with the published oneOf schema'
     assert.equal(batchBranch.properties.path, undefined, 'the batch branch publishes no path key')
     assert.equal(batchBranch.properties.before_commit.type, 'string', 'the batch branch requires a string before_commit')
     assert.equal(batchBranch.properties.before_commit.minLength, 1, 'the batch branch requires a non-empty before_commit')
+    const props = registered.parameters.properties
+    const fields = [
+      ['claims[].path', pathBranch.properties.path, 'a.js'],
+      ['claims[].before_commit', batchBranch.properties.before_commit, 'abc123'],
+      ['repository_root', props.repository_root, process.cwd()],
+      ['reviewed_code_files[]', props.reviewed_code_files.items, 'a.js'],
+      ['demonstrated_files[].path', props.demonstrated_files.items.properties.path, 'a.js'],
+      ['demonstrated_files[].note', props.demonstrated_files.items.properties.note, 'a note'],
+      ['items[].id', props.items.items.properties.id, 'unit'],
+    ]
+    for (const [label, field, valid] of fields) {
+      assert.equal(field.minLength, 1, `the published ${label} requires a non-empty string`)
+      assert.equal(field.pattern, '\\S', `the published ${label} requires a non-whitespace character`)
+      assert.equal(new RegExp(field.pattern).test('   '), false, `the published ${label} refuses a whitespace-only literal`)
+      assert.equal(new RegExp(field.pattern).test(valid), true, `the published ${label} still accepts ${valid}`)
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -1086,6 +1110,36 @@ test('T2 before_commit refuses an unreadable per-path history naming the reposit
   }
 })
 
+test('T2 before_commit refuses an unreadable uncommitted state naming the path, repository, and commit', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  const indexPath = path.join(repo, '.git', 'index')
+  let restored = false
+  try {
+    const agent = agentFor(repo)
+    announce(svc, 'session-1', 1, 500, [file('old.js'), file('at.js')], repo)
+    await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [
+      { path: 'old.js', decision: 'mine' }, { path: 'at.js', decision: 'mine' },
+    ] })
+    fs.chmodSync(indexPath, 0o000)
+    assert.throws(() => git(repo, ['status', '--porcelain=v1', '--', 'old.js']), 'precondition: status fails while the index is unreadable')
+    git(repo, ['log', '-1', '--format=%H', '--', 'old.js'])
+    git(repo, ['rev-list', '--max-count=1', 'HEAD'])
+    let message = ''
+    try { await svc.attest(agent, { ...batchClear(before), repository_root: repo }) }
+    catch (error) { message = error.message }
+    assert.ok(message.includes(repo), `the refusal must name the repository: ${message}`)
+    assert.match(message, /Cannot read the uncommitted state of (old|at)\.js in /, `the refusal names a relative path of an unreadable status: ${message}`)
+    assert.ok(message.includes(before), `the refusal must name the before_commit input: ${message}`)
+    assert.equal(claimByPath(svc, agent)['old.js'], 'mine', 'nothing is cleared when the uncommitted state is unreadable')
+    fs.chmodSync(indexPath, 0o644)
+    restored = true
+  } finally {
+    if (!restored) fs.chmodSync(indexPath, 0o644)
+    fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true })
+  }
+})
+
 test('T2 before_commit refuses a merge-base error other than the not-ancestor answer', async t => {
   const { repo, before } = historyRepo(t)
   const svc = service()
@@ -1149,13 +1203,14 @@ test('T2 a before_commit batch stays a constant plus a small number of git spawn
     const one = await measure([{ before_commit: named, decision: 'not-mine' }])
     const two = await measure([{ before_commit: named, decision: 'not-mine' }, { before_commit: named, decision: 'not-mine' }])
     // One shared readable check plus two reads per path, then one resolve plus one ancestry per path and entry.
-    const bound = 4 + 2 * N + 2 * (1 + N)
-    console.log(`T2 spawn shape: none=${none.spawns} one=${one.spawns} two=${two.spawns} bound=${bound} paths=${N} wall=${two.ms}ms`)
+    // Pin the exact counts: a partial regression that repeats a shared read inside the entry loop moves one
+    // count by one and two by two, so an upper bound with slack would let it pass.
+    const expectedOne = 1 + 2 * N + 1 + N
+    const expectedTwo = 1 + 2 * N + 2 * (1 + N)
+    console.log(`T2 spawn shape: none=${none.spawns} one=${one.spawns} two=${two.spawns} expectedOne=${expectedOne} expectedTwo=${expectedTwo} paths=${N} wall=${two.ms}ms`)
     assert.equal(none.spawns, 0, 'an attest with no batch starts no git processes')
-    assert.ok(one.spawns <= 2 + 2 * N + 1 + N, `one entry must not repeat the shared reads: ${one.spawns}`)
-    assert.ok(two.spawns <= bound, `two entries over ${N} paths must stay under ${bound}, got ${two.spawns}`)
-    assert.ok(two.spawns < 1204, 'the 200-path, two-entry shape must start far fewer processes than the per-entry fan-out')
-    assert.ok(two.ms < 15000, `the 200-path, two-entry shape should finish in seconds, took ${two.ms}ms`)
+    assert.equal(one.spawns, expectedOne, `one entry must not repeat the shared reads: ${one.spawns}`)
+    assert.equal(two.spawns, expectedTwo, `two entries over ${N} paths must not repeat the shared reads: ${two.spawns}`)
   } finally {
     process.env.PATH = originalPath
     delete process.env.GIT_SPAWN_LOG
