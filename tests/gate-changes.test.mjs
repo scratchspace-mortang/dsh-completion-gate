@@ -767,8 +767,9 @@ test('a subagent session is reported as not covered by the host change recorder'
 })
 
 // T2: a repository whose history gives each filed path a distinct last-change state relative to one
-// named commit. `old.js` was last changed strictly before it, `at.js` by the commit itself, and
-// `dirty.js` carries an uncommitted change on top of a last commit that is strictly before it.
+// named commit. `old.js` was last changed strictly before it, `at.js` by the commit itself, `later.js`
+// strictly after it, and `dirty.js` carries an uncommitted change on top of a last commit that is
+// strictly before it.
 function historyRepo(t) {
   const repo = tempRepo(t)
   fs.writeFileSync(path.join(repo, 'old.js'), 'const old = 1\n')
@@ -779,19 +780,45 @@ function historyRepo(t) {
   git(repo, ['add', '-A'])
   git(repo, ['commit', '-qm', 'new work'])
   const before = git(repo, ['rev-parse', 'HEAD']).trim()
+  fs.writeFileSync(path.join(repo, 'later.js'), 'const later = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'later work'])
   fs.writeFileSync(path.join(repo, 'dirty.js'), 'const dirty = 2\n')
   return { repo, before }
 }
 
-// File the three paths and give each an initial `mine` claim, so a later batch can be judged by
+// A repository with two files whose names match the same glob pathspec. `a[1].js` was last changed
+// strictly before the named commit, while that commit created `a1.js`; a raw pathspec for the filed
+// bracket name would glob onto the plain file and take its history instead.
+function globRepo(t) {
+  const repo = tempRepo(t)
+  fs.writeFileSync(path.join(repo, 'a[1].js'), 'const bracket = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'bracket file'])
+  fs.writeFileSync(path.join(repo, 'a1.js'), 'const plain = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'plain file'])
+  return { repo, before: git(repo, ['rev-parse', 'HEAD']).trim() }
+}
+
+// File the history paths and give each an initial `mine` claim, so a later batch can be judged by
 // what it changes (or keeps) rather than by filling an unclaimed ledger.
 async function fileAndClaimMine(svc, agent, repo) {
-  announce(svc, 'session-1', 1, 500, [file('old.js'), file('at.js'), file('dirty.js')], repo)
+  const names = ['old.js', 'at.js', 'dirty.js', 'later.js']
+  announce(svc, 'session-1', 1, 500, names.map(file), repo)
   return svc.attest(agent, {
     action: 'attest', repository_root: repo,
-    claims: ['old.js', 'at.js', 'dirty.js'].map(p => ({ path: p, decision: 'mine' })),
+    claims: names.map(p => ({ path: p, decision: 'mine' })),
   })
 }
+
+// File one named path as mine in a repository built by one of the helpers above.
+async function fileOneMine(svc, agent, repo, name) {
+  announce(svc, 'session-1', 1, 500, [file(name)], repo)
+  return svc.attest(agent, { action: 'attest', repository_root: repo, claims: [{ path: name, decision: 'mine' }] })
+}
+
+const batchClear = before => ({ action: 'attest', claims: [{ before_commit: before, decision: 'not-mine' }] })
 
 function claimByPath(svc, agent) {
   const snapshot = svc.repositories.repositories(agent.id)
@@ -897,15 +924,241 @@ test('T2 a refused before_commit batch writes nothing', async t => {
   } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
 })
 
-test('T2 a before_commit decision other than not-mine is refused with the value named', t => {
-  const errors = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ before_commit: 'abc123', decision: 'mine' }] })
-  assert.ok(errors.some(error => error.includes('mine')), `the validator must name the decision value: ${errors.join('; ')}`)
+test('T2 a before_commit decision other than not-mine is refused with the value named', async t => {
+  // 'maybe' is a value the fixed wording 'not-mine' cannot contain, so a dropped interpolation fails this test.
+  const errors = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ before_commit: 'abc123', decision: 'maybe' }] })
+  assert.ok(errors.some(error => error.includes('"maybe"')), `the validator must name the quoted decision value: ${errors.join('; ')}`)
   assert.deepEqual(attestSchemaErrors({ repository_root: process.cwd(), claims: [{ before_commit: 'abc123', decision: 'not-mine' }] }), [], 'a not-mine batch entry is valid')
   const { instance, registered, dir } = toolService()
   try {
+    const svc = service()
+    try {
+      let message = ''
+      try {
+        await svc.attest(agentFor(process.cwd()), { action: 'attest', repository_root: process.cwd(), claims: [{ before_commit: 'abc123', decision: 'maybe' }] })
+      } catch (error) { message = error.message }
+      assert.ok(message.includes('"maybe"'), `the end-to-end refusal must name the quoted decision value: ${message}`)
+    } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
     const oneOf = registered.parameters.properties.claims.items.oneOf
     const batch = oneOf.find(variant => variant.properties?.before_commit)
     assert.ok(batch, 'the tool schema publishes a before_commit claims branch')
     assert.deepEqual(batch.properties.decision.enum ?? [batch.properties.decision.const], ['not-mine'], 'the tool schema constrains a before_commit decision to not-mine')
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('T2 claims validate key presence and agree with the published oneOf schema', t => {
+  const both = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ path: 'a.js', before_commit: 'abc123', decision: 'not-mine' }] })
+  assert.ok(both.some(error => error.includes('exactly one of path or before_commit')), `both keys must be refused: ${both.join('; ')}`)
+  const neither = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ decision: 'not-mine' }] })
+  assert.ok(neither.some(error => error.includes('exactly one of path or before_commit')), `neither key must be refused: ${neither.join('; ')}`)
+  const nonString = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ path: 'a.js', before_commit: 5, decision: 'mine' }] })
+  assert.ok(nonString.some(error => error.includes('before_commit must be a non-empty string')), `a non-string before_commit key must be refused: ${nonString.join('; ')}`)
+  const emptyPath = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ path: '', before_commit: 'HEAD', decision: 'not-mine' }] })
+  assert.ok(emptyPath.some(error => error.includes('path must be a non-empty string')), `an empty path key must be refused: ${emptyPath.join('; ')}`)
+  const { registered, dir } = toolService()
+  try {
+    const oneOf = registered.parameters.properties.claims.items.oneOf
+    const pathBranch = oneOf.find(variant => variant.properties?.path)
+    const batchBranch = oneOf.find(variant => variant.properties?.before_commit)
+    assert.equal(pathBranch.additionalProperties, false, 'the path branch forbids a before_commit key')
+    assert.equal(pathBranch.properties.before_commit, undefined, 'the path branch publishes no before_commit key')
+    assert.equal(pathBranch.properties.path.minLength, 1, 'the path branch requires a non-empty path')
+    assert.equal(batchBranch.additionalProperties, false, 'the batch branch forbids a path key')
+    assert.equal(batchBranch.properties.path, undefined, 'the batch branch publishes no path key')
+    assert.equal(batchBranch.properties.before_commit.type, 'string', 'the batch branch requires a string before_commit')
+    assert.equal(batchBranch.properties.before_commit.minLength, 1, 'the batch branch requires a non-empty before_commit')
+  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit keeps a path committed after the named commit', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    await svc.attest(agent, { ...batchClear(before), repository_root: repo })
+    assert.equal(claimByPath(svc, agent)['later.js'], 'mine', 'a path committed strictly after the commit keeps its claim')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 a batch entry over a path explicitly claimed in one call is refused by name with nothing written', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    let message = ''
+    try {
+      await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [
+        { path: 'old.js', decision: 'mine' },
+        { before_commit: before, decision: 'not-mine' },
+      ] })
+    } catch (error) { message = error.message }
+    assert.match(message, /old\.js/, `the refusal names the shared path: ${message}`)
+    assert.match(message, /ambiguous/, 'the refusal names the ambiguity class')
+    const claims = claimByPath(svc, agent)
+    assert.equal(claims['old.js'], 'mine', 'the explicit claim keeps its ledger place')
+    assert.equal(claims['at.js'], 'mine', 'the untouched path is unchanged')
+    assert.equal(claims['later.js'], 'mine', 'the untouched path is unchanged')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 every unresolvable before_commit name appears in one refusal', async t => {
+  const { repo } = historyRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    let message = ''
+    try {
+      await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [
+        { before_commit: 'nope1', decision: 'not-mine' },
+        { before_commit: 'nope2', decision: 'not-mine' },
+      ] })
+    } catch (error) { message = error.message }
+    assert.match(message, /nope1/, 'the first unresolvable name is named')
+    assert.match(message, /nope2/, 'the second unresolvable name is named in the same refusal')
+    assert.equal(claimByPath(svc, agent)['old.js'], 'mine', 'nothing is cleared by the refused batch')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit judges a filed glob path by its literal name', async t => {
+  const { repo, before } = globRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileOneMine(svc, agent, repo, 'a[1].js')
+    await svc.attest(agent, { ...batchClear(before), repository_root: repo })
+    assert.equal(claimByPath(svc, agent)['a[1].js'], 'not-mine', 'a bracket-named path is cleared from its own history')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit keeps a glob path clear when a glob-matched sibling is dirty', async t => {
+  const { repo, before } = globRepo(t)
+  const svc = service()
+  try {
+    const agent = agentFor(repo)
+    await fileOneMine(svc, agent, repo, 'a[1].js')
+    fs.writeFileSync(path.join(repo, 'a1.js'), 'const plain = 2\n')
+    assert.match(git(repo, ['status', '--porcelain=v1', '--', 'a1.js']), /a1\.js/, 'precondition: the sibling is dirty')
+    await svc.attest(agent, { ...batchClear(before), repository_root: repo })
+    assert.equal(claimByPath(svc, agent)['a[1].js'], 'not-mine', 'a dirty glob sibling does not keep the filed bracket path')
+  } finally { fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true }) }
+})
+
+test('T2 before_commit refuses an unreadable per-path history naming the repository and path', async t => {
+  const repo = tempRepo(t)
+  fs.writeFileSync(path.join(repo, 'old.js'), 'const old = 1\n')
+  fs.mkdirSync(path.join(repo, 'sub'))
+  fs.writeFileSync(path.join(repo, 'sub', 'x.js'), 'const x = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'old work'])
+  fs.writeFileSync(path.join(repo, 'at.js'), 'const at = 1\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'new work'])
+  const before = git(repo, ['rev-parse', 'HEAD']).trim()
+  const subTree = git(repo, ['rev-parse', 'HEAD~1:sub']).trim()
+  const objectPath = path.join(repo, '.git', 'objects', subTree.slice(0, 2), subTree.slice(2))
+  assert.ok(fs.existsSync(objectPath), 'precondition: the sub tree object is loose')
+  const svc = service()
+  let restored = false
+  try {
+    const agent = agentFor(repo)
+    announce(svc, 'session-1', 1, 500, [file('old.js'), file('sub/x.js')], repo)
+    await svc.attest(agent, { action: 'attest', repository_root: repo, claims: [
+      { path: 'old.js', decision: 'mine' }, { path: 'sub/x.js', decision: 'mine' },
+    ] })
+    fs.chmodSync(objectPath, 0o000)
+    git(repo, ['rev-list', '--max-count=1', 'HEAD'])
+    assert.throws(() => git(repo, ['log', '-1', '--format=%H', '--', 'sub/x.js']), 'precondition: the sub path log fails while HEAD still reads')
+    let message = ''
+    try { await svc.attest(agent, { ...batchClear(before), repository_root: repo }) }
+    catch (error) { message = error.message }
+    assert.ok(message.includes(repo), `the refusal must name the repository: ${message}`)
+    assert.match(message, /sub\/x\.js/, 'the refusal names the path whose history failed')
+    assert.match(message, /history/i, 'the refusal names the unreadable history')
+    assert.equal(claimByPath(svc, agent)['old.js'], 'mine', 'nothing is cleared when one path is unreadable')
+    fs.chmodSync(objectPath, 0o644)
+    restored = true
+  } finally {
+    if (!restored) fs.chmodSync(objectPath, 0o644)
+    fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true })
+  }
+})
+
+test('T2 before_commit refuses a merge-base error other than the not-ancestor answer', async t => {
+  const { repo, before } = historyRepo(t)
+  const svc = service()
+  const shimDir = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'cg-gate-gitshim-')))
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+  fs.writeFileSync(path.join(shimDir, 'git'), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = "merge-base" ]; then echo "simulated merge-base failure" >&2; exit 2; fi; done\nexec ${realGit} "$@"\n`)
+  fs.chmodSync(path.join(shimDir, 'git'), 0o755)
+  const originalPath = process.env.PATH
+  try {
+    const agent = agentFor(repo)
+    await fileAndClaimMine(svc, agent, repo)
+    process.env.PATH = `${shimDir}:${originalPath}`
+    let message = ''
+    try { await svc.attest(agent, { ...batchClear(before), repository_root: repo }) }
+    catch (error) { message = error.message }
+    assert.ok(message.includes(repo), `the refusal must name the repository: ${message}`)
+    assert.match(message, /compare the history of [^ ]+\.js with before_commit/, 'the refusal names the path whose ancestry could not be read')
+    assert.equal(claimByPath(svc, agent)['old.js'], 'mine', 'nothing is cleared when ancestry is unreadable')
+  } finally {
+    process.env.PATH = originalPath
+    fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true })
+  }
+})
+
+test('T2 a before_commit batch stays a constant plus a small number of git spawns per path and entry', async t => {
+  const N = 200
+  const repo = tempRepo(t)
+  const names = []
+  for (let i = 0; i < N; i += 1) {
+    const name = `p${String(i).padStart(3, '0')}.js`
+    fs.writeFileSync(path.join(repo, name), `const p${i} = ${i}\n`)
+    names.push(name)
+  }
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'many files'])
+  fs.writeFileSync(path.join(repo, 'unrelated.txt'), 'x\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'unrelated'])
+  const named = git(repo, ['rev-parse', 'HEAD']).trim()
+  const svc = service()
+  const shimDir = fs.realpathSync(fs.mkdtempSync(path.join(workRoot, 'cg-gate-shim-')))
+  const spawnLog = path.join(shimDir, 'spawns.log')
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+  fs.writeFileSync(path.join(shimDir, 'git'), `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GIT_SPAWN_LOG"\nexec ${realGit} "$@"\n`)
+  fs.chmodSync(path.join(shimDir, 'git'), 0o755)
+  fs.writeFileSync(spawnLog, '')
+  const originalPath = process.env.PATH
+  try {
+    const agent = agentFor(repo)
+    announce(svc, 'session-1', 1, 500, names.map(file), repo)
+    await svc.attest(agent, { action: 'attest', repository_root: repo, claims: names.map(name => ({ path: name, decision: 'mine' })) })
+    process.env.PATH = `${shimDir}:${originalPath}`
+    process.env.GIT_SPAWN_LOG = spawnLog
+    const measure = async claims => {
+      fs.writeFileSync(spawnLog, '')
+      const started = Date.now()
+      await svc.attest(agent, { action: 'attest', repository_root: repo, claims })
+      return { spawns: fs.readFileSync(spawnLog, 'utf8').split('\n').filter(Boolean).length, ms: Date.now() - started }
+    }
+    const none = await measure([])
+    const one = await measure([{ before_commit: named, decision: 'not-mine' }])
+    const two = await measure([{ before_commit: named, decision: 'not-mine' }, { before_commit: named, decision: 'not-mine' }])
+    // One shared readable check plus two reads per path, then one resolve plus one ancestry per path and entry.
+    const bound = 4 + 2 * N + 2 * (1 + N)
+    console.log(`T2 spawn shape: none=${none.spawns} one=${one.spawns} two=${two.spawns} bound=${bound} paths=${N} wall=${two.ms}ms`)
+    assert.equal(none.spawns, 0, 'an attest with no batch starts no git processes')
+    assert.ok(one.spawns <= 2 + 2 * N + 1 + N, `one entry must not repeat the shared reads: ${one.spawns}`)
+    assert.ok(two.spawns <= bound, `two entries over ${N} paths must stay under ${bound}, got ${two.spawns}`)
+    assert.ok(two.spawns < 1204, 'the 200-path, two-entry shape must start far fewer processes than the per-entry fan-out')
+    assert.ok(two.ms < 15000, `the 200-path, two-entry shape should finish in seconds, took ${two.ms}ms`)
+  } finally {
+    process.env.PATH = originalPath
+    delete process.env.GIT_SPAWN_LOG
+    fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true })
+  }
 })
