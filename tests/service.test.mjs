@@ -684,6 +684,11 @@ const execOf = a => ({ agent: a, signal: new AbortController().signal })
 const attestArgs = (session, extra) => ({ action: 'attest', repository_root: session, ...extra })
 const completeAttest = session => attestArgs(session, { claims: [{ path: 'app.js', decision: 'mine' }], reviewed_code_files: ['app.js'], demonstrated_files: [{ path: 'app.js', note: 'ran the fixture' }], items: [{ id: 'unit', state: 'passed' }] })
 const linesOf = async (svc, a) => (await svc.__tool.execute({ action: 'status' }, execOf(a))).markdown.split('\n')
+// T4-R5 class fix: all four group collection loops (claims, reviewed, adopted, demonstrated) feed one
+// first-insert group set, so every group-count test asserts the exact counted-line list. A first-insert
+// double-add renders two identical lines and a dropped group renders none; both fail here by name.
+const assertOneCountedGroup = (markdown, expected, message) =>
+  assert.deepEqual(markdown.split('\n').filter(line => line.includes('paths matched by')), [expected], `${message}: ${markdown}`)
 async function attestFixture(t, files = ['app.js']) {
   const session = attestRepo()
   for (const file of files) if (!fs.existsSync(path.join(session, file))) fs.writeFileSync(path.join(session, file), 'x\n')
@@ -1135,7 +1140,7 @@ test('T4 compact attest counts a group instead of listing each filed path', asyn
     claims: [{ path: 'shared-*', decision: 'not-mine' }], items: [],
   }), execOf(a))
   const lines = result.markdown.split('\n')
-  assert.ok(lines.includes('3 paths matched by shared-*'), `the group is counted: ${result.markdown}`)
+  assertOneCountedGroup(result.markdown, '3 paths matched by shared-*', 'the group is counted')
   for (const name of ['shared-a.js', 'shared-b.js', 'shared-c.js']) {
     assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode lists ${name} individually: ${result.markdown}`)
   }
@@ -1247,8 +1252,7 @@ test('T4 one group value in four arguments prints one counted line', async t => 
     demonstrated_files: [{ path: 'shared-*', note: 'ran the fixture' }],
     items: [],
   }), execOf(a))
-  const lines = result.markdown.split('\n').filter(line => line.includes('paths matched by'))
-  assert.deepEqual(lines, ['2 paths matched by shared-*'], `one counted line per group value: ${result.markdown}`)
+  assertOneCountedGroup(result.markdown, '2 paths matched by shared-*', 'one counted line per group value')
 })
 
 // T4-R1-14: groups outside claims still count and still hide the paths they cover.
@@ -1261,7 +1265,7 @@ test('T4 a group in reviewed_code_files is counted and its covered paths are hid
     items: [],
   }), execOf(a))
   const lines = result.markdown.split('\n')
-  assert.ok(lines.includes('2 paths matched by rev-*'), `the reviewed group is counted: ${result.markdown}`)
+  assertOneCountedGroup(result.markdown, '2 paths matched by rev-*', 'the reviewed group is counted')
   for (const name of ['rev-a.js', 'rev-b.js']) {
     assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the reviewed group: ${result.markdown}`)
   }
@@ -1276,7 +1280,7 @@ test('T4 a group in adopted_files is counted and its covered paths are hidden', 
     items: [],
   }), execOf(a))
   const lines = result.markdown.split('\n')
-  assert.deepEqual(lines.filter(line => line.includes('paths matched by')), ['2 paths matched by ad-*'], `the adopted group is counted: ${result.markdown}`)
+  assertOneCountedGroup(result.markdown, '2 paths matched by ad-*', 'the adopted group is counted')
   for (const name of ['ad-a.js', 'ad-b.js']) {
     assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the adopted group: ${result.markdown}`)
   }
@@ -1291,7 +1295,7 @@ test('T4 a group in demonstrated_files is counted and its covered paths are hidd
     items: [],
   }), execOf(a))
   const lines = result.markdown.split('\n')
-  assert.deepEqual(lines.filter(line => line.includes('paths matched by')), ['2 paths matched by de-*'], `the demonstrated group is counted: ${result.markdown}`)
+  assertOneCountedGroup(result.markdown, '2 paths matched by de-*', 'the demonstrated group is counted')
   for (const name of ['de-a.js', 'de-b.js']) {
     assert.ok(!lines.some(line => line.startsWith(`- ${path.join(session, name)} (`)), `compact mode hides ${name} covered by the demonstrated group: ${result.markdown}`)
   }
