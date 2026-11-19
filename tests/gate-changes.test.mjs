@@ -946,7 +946,7 @@ test('T2 a before_commit decision other than not-mine is refused with the value 
   } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('T2 claims validate key presence and agree with the published oneOf schema', t => {
+test('T2 claims validate key presence and agree with the published oneOf schema', async t => {
   const both = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ path: 'a.js', before_commit: 'abc123', decision: 'not-mine' }] })
   assert.ok(both.some(error => error.includes('exactly one of path or before_commit')), `both keys must be refused: ${both.join('; ')}`)
   const neither = attestSchemaErrors({ repository_root: process.cwd(), claims: [{ decision: 'not-mine' }] })
@@ -963,7 +963,10 @@ test('T2 claims validate key presence and agree with the published oneOf schema'
   assert.ok(whitespaceCommit.some(error => error.includes('before_commit must be a non-empty string')), `a whitespace-only before_commit must be refused by the handler: ${whitespaceCommit.join('; ')}`)
   const whitespaceRoot = attestSchemaErrors({ repository_root: '   ', claims: [] })
   assert.ok(whitespaceRoot.some(error => error.includes('repository_root is required')), `a whitespace-only repository_root must be refused by the handler: ${whitespaceRoot.join('; ')}`)
+  const whitespaceAdopted = attestSchemaErrors({ repository_root: process.cwd(), adopted_files: ['   '] })
+  assert.ok(whitespaceAdopted.some(error => error.includes('adopted_files must be an array of non-empty paths')), `a whitespace-only adopted file must be refused by the handler: ${whitespaceAdopted.join('; ')}`)
   const { registered, dir } = toolService()
+  const svc = service()
   try {
     const oneOf = registered.parameters.properties.claims.items.oneOf
     const pathBranch = oneOf.find(variant => variant.properties?.path)
@@ -981,9 +984,14 @@ test('T2 claims validate key presence and agree with the published oneOf schema'
       ['claims[].before_commit', batchBranch.properties.before_commit, 'abc123'],
       ['repository_root', props.repository_root, process.cwd()],
       ['reviewed_code_files[]', props.reviewed_code_files.items, 'a.js'],
+      ['adopted_files[]', props.adopted_files.items, 'a.js'],
       ['demonstrated_files[].path', props.demonstrated_files.items.properties.path, 'a.js'],
       ['demonstrated_files[].note', props.demonstrated_files.items.properties.note, 'a note'],
       ['items[].id', props.items.items.properties.id, 'unit'],
+      ['items[].name', props.items.items.properties.name, 'Unit'],
+      ['items[].proves', props.items.items.properties.proves, 'It works.'],
+      ['items[].command', props.items.items.properties.command, 'npm test'],
+      ['items[].reason', props.items.items.properties.reason, 'not run yet'],
     ]
     for (const [label, field, valid] of fields) {
       assert.equal(field.minLength, 1, `the published ${label} requires a non-empty string`)
@@ -991,7 +999,35 @@ test('T2 claims validate key presence and agree with the published oneOf schema'
       assert.equal(new RegExp(field.pattern).test('   '), false, `the published ${label} refuses a whitespace-only literal`)
       assert.equal(new RegExp(field.pattern).test(valid), true, `the published ${label} still accepts ${valid}`)
     }
-  } finally { fs.rmSync(dir, { recursive: true, force: true }) }
+    // Handler side for the item strings, through the same published tool: register trims and refuses name and
+    // proves, and drops a blank command; attest drops an assumed item whose reason trims to empty.
+    const repo = tempRepo(t)
+    const agent = agentFor(repo)
+    const exec = { agent, signal: new AbortController().signal }
+    await assert.rejects(
+      registered.execute({ action: 'register', repository_root: repo, items: [{ name: '   ', proves: 'It works.' }] }, exec),
+      /items\[0\]\.name is required, and it is empty\./,
+      'the register handler refuses a whitespace-only item name',
+    )
+    await assert.rejects(
+      registered.execute({ action: 'register', repository_root: repo, items: [{ name: 'Unit', proves: '   ' }] }, exec),
+      /items\[0\]\.proves is required, and it is empty\./,
+      'the register handler refuses a whitespace-only item proves',
+    )
+    await registered.execute({ action: 'register', repository_root: repo, items: [{ name: 'Unit', proves: 'It works.', command: '   ' }] }, exec)
+    const stored = JSON.parse(fs.readFileSync(path.join(repo, '.dsh', 'verification.json'), 'utf8'))
+    assert.equal(Object.hasOwn(stored.items[0], 'command'), false, 'the register handler drops a whitespace-only command')
+    const reasonRepo = tempRepo(t)
+    writeUnitCatalog(reasonRepo)
+    const reasonAgent = agentFor(reasonRepo)
+    await svc.attest(reasonAgent, { action: 'attest', repository_root: reasonRepo, items: [{ id: 'unit', state: 'assumed', reason: '   ' }] })
+    const [reasonSnapshot] = svc.repositories.repositories(reasonAgent.id)
+    assert.equal(reasonSnapshot.itemStates[0].state, null, 'a whitespace-only assumed reason leaves the item unreported')
+    assert.equal(reasonSnapshot.itemStates[0].reason, undefined, 'a whitespace-only assumed reason is not stored')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(svc.__testSettingsDir, { recursive: true, force: true })
+  }
 })
 
 test('T2 before_commit keeps a path committed after the named commit', async t => {
