@@ -316,7 +316,7 @@ test('T5 a fresh catalog under umask 077 is created with the umask mode', async 
   try {
     const result = await registerItems(repo, [{ name: 'Lint', proves: 'No lint errors.' }])
     assert.equal(result.exclusion.applied, true, 'the exclusion is applied')
-    assert.equal(modeOf(path.join(repo, '.dsh', 'verification.json')), '600', 'a new catalog gets 0o666 and not the umask bits')
+    assert.equal(modeOf(path.join(repo, '.dsh', 'verification.json')), '600', 'a first write requests 0o666 and the process umask masks it, so umask 077 yields 600')
     assert.equal(readCatalog(repo).items[0].id, 'lint', 'the catalog is written')
   } finally { process.umask(prior) }
 })
@@ -329,7 +329,7 @@ test('T5 an exclude deleted before register is recreated with the umask mode', a
   try {
     const result = await registerItems(repo, [{ name: 'Lint', proves: 'No lint errors.' }])
     assert.equal(result.exclusion.applied, true, 'the exclusion is applied')
-    assert.equal(modeOf(exclude), '600', 'a recreated exclude gets 0o666 and not the umask bits')
+    assert.equal(modeOf(exclude), '600', 'a first write requests 0o666 and the process umask masks it, so umask 077 yields 600')
     assert.ok(excludeLines(repo).includes('.dsh/verification.json'), 'the catalog line is written')
     assert.ok(excludeLines(repo).includes('.dsh/verification-archive.json'), 'the archive line is written')
   } finally { process.umask(prior) }
