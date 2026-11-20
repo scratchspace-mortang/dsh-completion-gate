@@ -269,6 +269,72 @@ test('T5 a private exclude file keeps its mode and rules across a register', asy
   assert.equal(spawnSync('git', ['check-ignore', '-q', 'probe.log'], { cwd: repo }).status, 0, 'the surviving *.log rule still ignores')
 })
 
+const modeOf = file => (fs.statSync(file).mode & 0o7777).toString(8)
+
+// The mode a rewrite carries is data, not a constant: a second seeded value catches a mutant that hard-codes the
+// first test's 600, and a seeded setuid bit catches a mutant that widens or narrows the 0o7777 mask. Both tests also
+// assert the unrelated rules survive byte-for-byte, as the original 600-seed test does.
+test('T5 a second exclude mode (644) survives a register rewrite with its rules', async t => {
+  const repo = gitRepo('exclude-mode-644-')
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  const seed = '# keep me\n*.log\n'
+  fs.writeFileSync(exclude, seed)
+  fs.chmodSync(exclude, 0o644)
+  assert.equal(modeOf(exclude), '644', 'the seed is in place before register')
+  const result = await registerItems(repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+  assert.equal(result.exclusion.applied, true, 'the exclusion is applied')
+  assert.equal(modeOf(exclude), '644', 'the 644 mode survives the atomic rewrite')
+  const after = fs.readFileSync(exclude, 'utf8')
+  assert.ok(after.includes('# keep me'), 'the unrelated comment survives byte-for-byte')
+  assert.ok(after.includes('*.log'), 'the unrelated log rule survives byte-for-byte')
+  assert.ok(after.includes('.dsh/verification.json'), 'the catalog line is written')
+  assert.ok(after.includes('.dsh/verification-archive.json'), 'the archive line is written')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', 'probe.log'], { cwd: repo }).status, 0, 'the surviving *.log rule still ignores')
+})
+
+test('T5 special bits in an exclude mode survive a register rewrite exactly', async t => {
+  const repo = gitRepo('exclude-mode-special-')
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  fs.writeFileSync(exclude, '# keep me\n*.log\n')
+  fs.chmodSync(exclude, 0o4644)
+  assert.equal(modeOf(exclude), '4644', 'the seed is in place before register')
+  const result = await registerItems(repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+  assert.equal(result.exclusion.applied, true, 'the exclusion is applied')
+  assert.equal(modeOf(exclude), '4644', 'the exact masked mode, including the setuid bit, survives')
+  const after = fs.readFileSync(exclude, 'utf8')
+  assert.ok(after.includes('# keep me'), 'the unrelated comment survives byte-for-byte')
+  assert.ok(after.includes('*.log'), 'the unrelated log rule survives byte-for-byte')
+  assert.ok(after.includes('.dsh/verification.json'), 'the catalog line is written')
+  assert.equal(spawnSync('git', ['check-ignore', '-q', 'probe.log'], { cwd: repo }).status, 0, 'the surviving *.log rule still ignores')
+})
+
+// An absent target is left to the process umask. Each arm restores the prior umask in a finally so a failed
+// assertion cannot leak a process-wide mode into the rest of the suite.
+test('T5 a fresh catalog under umask 077 is created with the umask mode', async t => {
+  const repo = gitRepo('umask-catalog-')
+  const prior = process.umask(0o077)
+  try {
+    const result = await registerItems(repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+    assert.equal(result.exclusion.applied, true, 'the exclusion is applied')
+    assert.equal(modeOf(path.join(repo, '.dsh', 'verification.json')), '600', 'a new catalog gets 0o666 and not the umask bits')
+    assert.equal(readCatalog(repo).items[0].id, 'lint', 'the catalog is written')
+  } finally { process.umask(prior) }
+})
+
+test('T5 an exclude deleted before register is recreated with the umask mode', async t => {
+  const repo = gitRepo('umask-exclude-')
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  fs.unlinkSync(exclude)
+  const prior = process.umask(0o077)
+  try {
+    const result = await registerItems(repo, [{ name: 'Lint', proves: 'No lint errors.' }])
+    assert.equal(result.exclusion.applied, true, 'the exclusion is applied')
+    assert.equal(modeOf(exclude), '600', 'a recreated exclude gets 0o666 and not the umask bits')
+    assert.ok(excludeLines(repo).includes('.dsh/verification.json'), 'the catalog line is written')
+    assert.ok(excludeLines(repo).includes('.dsh/verification-archive.json'), 'the archive line is written')
+  } finally { process.umask(prior) }
+})
+
 test('T5 excludeCatalog refuses a root whose catalog path would carry a newline', async t => {
   const repo = gitRepo('newline-root-')
   const nested = path.join(repo, 'line\nbreak')
