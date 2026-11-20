@@ -9,6 +9,19 @@ Hourly advisory throttle: at most one non-credential advisory per session per ho
 - A stop whose only content is an unread file or a credential hit never overwrites held advisory facts, and the unread file still rides held gaps to the next spoken advisory.
 - Held facts that speak after their repository completed are labelled historical, not present unfinished work, and held notices are marked as hold-time unless the speaking stop re-observed the same fact, in which case the fact prints once with the current wording. A historical held snapshot never marks its repository introduced.
 
+## 0.5.0
+
+Attest scope, grouping, and the compact report. A shared group form, a batch claim by commit, all-turn child adoption, and a compact report make a large attestation cheaper to write and read, and the catalog hidden files are narrowed to the two exact paths.
+
+- One group form is accepted in `claims`, `adopted_files`, and `demonstrated_files` (and `reviewed_code_files`): an exact path, a prefix ending in `/` or `\`, or a pattern ending in `*`. A group expands over filed paths, carries its own decision, and files nothing new. A group and an exact entry, or two groups, naming the same filed path are refused with that path named and nothing written.
+- Add the `before_commit` claims batch entry with decision `not-mine`. It clears every filed path whose last committed change is strictly before the resolved commit, keeps paths that commit changed and paths with uncommitted changes, and refuses an unresolvable commit name or unreadable history by name with nothing written. The compact report counts the batch as `N paths rejected by before_commit <name>`.
+- Add the `adoptedChildIds` attest argument. Naming a child adopts every path it wrote in any turn; explicit `adopted_files` still work, a path another session also wrote still needs that session's adoption, and a `not-mine` rejection never adopts. The tool schema description and the system-prompt adoption paragraph both state the rule.
+- The status action, both report commands, and the attest result are compact by default. A group is counted as `N paths matched by <value>` and a batch as `N paths rejected by before_commit <name>`; one hint line says to call `completion_gate` with `action attest` and `verbose true` for the full list. `verbose` on `attest` restores the per-path list; the other call sites take no verbose and stay compact.
+- `items` accepts `name`, `proves`, and `command` alongside `id`, `state`, and `reason`. Only the relevant fields are used, and the call still goes through with a warning naming the ignored fields; other unknown keys stay refused.
+- Raise the catalog `command` bound to 4000 characters.
+- Hide only the two exact catalog paths `.dsh/verification.json` and `.dsh/verification-archive.json` in the local exclude file, removing the older whole-directory `.dsh/` line so other `.dsh/` files stay visible. The tracked `.gitignore` is never edited.
+- Bump the package version to 0.5.0 and update the version test in the same commit.
+
 ## 0.4.0
 
 Catalog items are adoption-only, and the gate tracks only paths a root-session file tool names.
